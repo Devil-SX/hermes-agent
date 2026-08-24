@@ -276,6 +276,48 @@ def test_shared_group_observe_source_is_authorized_by_group_allowed_chats(monkey
     assert runner._is_user_authorized(source) is True
 
 
+def test_routed_group_observe_source_keeps_transport_authorization(monkeypatch):
+    """Attribution clones must retain the shared Telegram transport."""
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+
+    monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_CHATS", raising=False)
+    adapter = _make_adapter(
+        require_mention=True,
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    # The routed profile reuses the default profile's Telegram credential, so
+    # it intentionally has no second Telegram adapter of its own.
+    runner._profile_adapters = {"podcast": {}}
+    runner._active_profile_name = lambda: None
+    runner._profile_name_for_source = lambda _source: "podcast"
+    adapter.gateway_runner = runner
+
+    text = "@hermes_bot what did Alice say?"
+    message = _group_message(text, entities=[_mention_entity(text)])
+    event = adapter._build_message_event(
+        message,
+        MessageType.TEXT,
+        update_id=1004,
+    )
+    assert event.source.profile == "podcast"
+
+    attributed = adapter._apply_telegram_group_observe_attribution(event)
+
+    assert attributed.source.user_id is None
+    assert attributed.source._transport_adapter_ref() is adapter
+    assert runner._is_user_authorized(attributed.source) is True
+    # Transport provenance is local authority, never persisted or restored.
+    assert "_transport_adapter_ref" not in attributed.source.to_dict()
+    restored = SessionSource.from_dict(attributed.source.to_dict())
+    assert restored._transport_adapter_ref is None
+
+
 class _FakeSessionEntry:
     session_id = "telegram-group-session"
 

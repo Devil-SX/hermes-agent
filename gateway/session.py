@@ -185,6 +185,14 @@ class SessionSource:
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    # In-process provenance for the live adapter that received this source.
+    # Declaring it as a dataclass field makes dataclasses.replace() preserve it
+    # across routing/attribution clones. It remains deliberately absent from
+    # to_dict()/from_dict() so persistence and untrusted wire input cannot
+    # manufacture transport authority.
+    _transport_adapter_ref: Any = field(
+        default=None, repr=False, compare=False
+    )
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
