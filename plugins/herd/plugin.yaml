@@ -1,0 +1,4 @@
+name: herd
+version: 1.0.0
+description: "Headless agent fleet on herdr: /herd shows the pi worker card (names from the digital-VLSI pool, live status, model/thinking)."
+author: "Alfred owner"

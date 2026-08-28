@@ -10186,6 +10186,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
+        # --- Plugin slash commands are pure-program: dispatch inline ---
+        # Plugin-registered commands (e.g. /herd, /model_default) return a
+        # string from a plain function — no LLM, no session mutation. When
+        # they reach this busy path they would otherwise be treated as user
+        # text and interrupt (or queue against) the active run. Dispatch
+        # them here and reply directly, mirroring the cold-path plugin
+        # dispatch in _handle_message.
+        _evt_cmd_busy = event.get_command()
+        if _evt_cmd_busy:
+            try:
+                from hermes_cli.plugins import get_plugin_command_handler as _gpc_busy
+                _plugin_handler_busy = _gpc_busy(_evt_cmd_busy.replace("_", "-"))
+            except Exception as _plugin_err:
+                logger.warning("Busy-path plugin command lookup failed: %s", _plugin_err)
+                _plugin_handler_busy = None
+            if _plugin_handler_busy is not None:
+                _plugin_args_busy = event.get_command_args().strip()
+                _plugin_result = _plugin_handler_busy(_plugin_args_busy)
+                if asyncio.iscoroutine(_plugin_result):
+                    _plugin_result = await _plugin_result
+                _adapter_busy = self._adapter_for_source(event.source)
+                if _adapter_busy and _plugin_result:
+                    _text_busy, _eph_busy = _adapter_busy._unwrap_ephemeral(str(_plugin_result))
+                    if _text_busy:
+                        _anchor_busy = self._reply_anchor_for_event(event)
+                        try:
+                            await _adapter_busy._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=_text_busy,
+                                reply_to=_anchor_busy,
+                                metadata=self._thread_metadata_for_source(event.source, _anchor_busy),
+                            )
+                            if _eph_busy > 0:
+                                self._schedule_ephemeral_delete(
+                                    chat_id=event.source.chat_id,
+                                    message_id=None,
+                                    ttl_seconds=0,
+                                )
+                        except Exception as _send_err:
+                            logger.warning("Busy-path plugin reply failed: %s", _send_err)
+                return True
+
         effective_mode = self._effective_busy_input_mode(event.source)
 
         # --- Draining case (gateway restarting/stopping) ---
