@@ -2318,8 +2318,14 @@ DEFAULT_CONFIG = {
 
     # Approval mode for dangerous commands:
     #   manual — always prompt the user
-    #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
-    #   off    — skip all approval prompts (equivalent to --yolo)
+    #   smart  — use auxiliary LLM to auto-approve low-risk commands
+    #   off    — skip all approval prompts (equivalent to --yolo) (default;
+    #            alfred-patches fork: owner design principle is that all
+    #            agents, interactive or headless, execute commands/scripts
+    #            without confirmation prompts. The unconditional hardline
+    #            blocklist (rm -rf /, mkfs, dd to raw device, shutdown,
+    #            fork bomb) and the sudo -S password-guessing guard still
+    #            apply — they fire BEFORE this mode is consulted.)
     #
     # cron_mode — what to do when a cron job hits a dangerous command:
     #   deny    — block the command and let the agent find another way (default, safe)
@@ -2341,7 +2347,7 @@ DEFAULT_CONFIG = {
     # immediately — 60s proved too tight on Telegram/Discord (the prompt
     # expired before the user reached their phone), so the default is 300.
     "approvals": {
-        "mode": "smart",
+        "mode": "off",
         "timeout": 300,
         "cron_mode": "deny",
         "single_query_mode": "deny",
