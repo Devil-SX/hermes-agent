@@ -51,35 +51,33 @@ def _elapsed(iso_at: str, now: float) -> str:
 
 
 def render_card(rows: list[dict]) -> str:
-    if not rows:
-        return ("🐑 牧场空空 — 0 active · 0 archived · pool 30/30 free\n"
+    active_rows = [r for r in rows if r.get("status") != "archived"]
+    archived = sum(1 for r in rows if r.get("status") == "archived")
+    if not active_rows:
+        return (f"🐑 牧场空空 — 0 active · {archived} archived · pool 30/30 free\n"
                 "派活：说「派个 agent 去 <任务>」")
     now = time.time()
-    active = archived = 0
     lines = [
         "| Agent | 状态 | 模型 | 任务 | 时长 |",
         "|---|---|---|---|---|",
     ]
-    for row in rows:
+    active = 0
+    for row in active_rows:
         status = row.get("status", "unknown")
         glyph = STATUS_GLYPH.get(status, "·")
         emoji = row.get("emoji") or "🤖"
         name = row.get("name", "?")
         ident = row.get("identity", "")
         task = (row.get("task") or "")[:32] or "—"
-        if status == "working":
-            dur = _elapsed(row.get("spawned_at", ""), now)
-            active += 1
-        elif status == "archived":
-            dur = "—"
-            archived += 1
-        else:
-            dur = _elapsed(row.get("spawned_at", ""), now) if status != "gone" else "—"
-            active += 1
+        dur = _elapsed(row.get("spawned_at", ""), now) if status == "working" else \
+              (_elapsed(row.get("spawned_at", ""), now) if status != "gone" else "—")
+        active += 1
         lines.append(f"| {emoji} {name} | {glyph} {status} | {ident} | {task} | {dur} |")
-    pool_free = 30 - (active + archived)
+    # pool: 30 names minus names currently held by active agents
+    held = {r.get("name") for r in active_rows}
+    pool_free = 30 - len(held)
     lines.append("")
-    lines.append(f"**{active}** active · **{archived}** archived · pool {pool_free}/30 free")
+    lines.append(f"**{active}** active · pool {pool_free}/30 free")
     return "\n".join(lines)
 
 
