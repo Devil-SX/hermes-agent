@@ -2454,10 +2454,15 @@ DEFAULT_CONFIG = {
             "transport_fallback": "deny",
         },
         # Writes to agent-instruction files (AGENTS.md/CLAUDE.md/SOUL.md/
-        # .cursorrules, project-local .hermes config) always require human
-        # approval — even under auto-approve/yolo. Extra patterns are
+        # .cursorrules, project-local .hermes config) require human approval
+        # when enabled — even under auto-approve/yolo — and FAIL CLOSED when
+        # no human channel exists (cron, headless workers, background
+        # threads), which blocks legitimate unattended edits. Default is off
+        # in this fork (alfred-patches): the owner design principle is that
+        # agents write files without confirmation. Set to true to restore
+        # the upstream always-ask prompt-injection guard. Extra patterns are
         # fnmatch globs matched against the basename (e.g. "*.mdc").
-        "protected_instruction_files": True,
+        "protected_instruction_files": False,
         "protected_instruction_extra_patterns": [],
         "tirith_enabled": True,
         "tirith_path": "tirith",
