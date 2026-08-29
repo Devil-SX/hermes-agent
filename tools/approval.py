@@ -3469,7 +3469,13 @@ def _run_approval_gate(
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # approvals.mode=off is documented as "equivalent to --yolo"; honor it
+    # here too so gates routed through this shared core (plugin tool
+    # escalations, SSH-config writes, legacy check_dangerous_command) do
+    # not keep prompting — or fail-closed blocking headless workers — after
+    # the operator has disabled approvals globally (alfred-patches fork).
+    if (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+            or _get_approval_mode() == "off"):
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
