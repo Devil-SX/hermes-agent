@@ -2428,8 +2428,12 @@ DEFAULT_CONFIG = {
     # Auto-accept shell-hook registrations without a TTY prompt.  Also
     # toggleable per-invocation via --accept-hooks or HERMES_ACCEPT_HOOKS=1.
     # Gateway / cron / non-interactive runs need this (or one of the other
-    # channels) to pick up newly-added hooks.
-    "hooks_auto_accept": False,
+    # channels) to pick up newly-added hooks; without it the first-run
+    # consent prompt has no one to answer and the hook is skipped.  Default
+    # is on in this fork (alfred-patches): hooks are owner-authored in
+    # config.yaml and the owner design principle is no confirmation
+    # prompts for configured automation.
+    "hooks_auto_accept": True,
     # Custom personalities — add your own entries here
     # Supports string format: {"name": "system prompt"}
     # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
