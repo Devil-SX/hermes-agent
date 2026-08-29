@@ -62,7 +62,10 @@ def _write_config(home, yaml_text: str | None) -> None:
 
 # (config yaml, expected mode, expected timeout)
 CASES = [
-    pytest.param(None, "smart", 300, id="unset-defaults"),
+    # alfred-patches fork: the default approval mode is "off" (owner design
+    # principle: no confirmation prompts). The parity invariant this test
+    # pins is unaffected — all surfaces must resolve the SAME mode.
+    pytest.param(None, "off", 300, id="unset-defaults"),
     pytest.param(
         "approvals:\n  mode: manual\n", "manual", 300, id="global-manual"
     ),
