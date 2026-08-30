@@ -99,6 +99,46 @@ def test_background_and_main_agent_paths_call_refresh():
     assert "fallback_model=self._runner._fallback_model," not in source
 
 
+def test_refresh_fallback_model_honors_profile_home_override(tmp_path, monkeypatch):
+    """Multiplex profile turns must read the PROFILE's fallback chain.
+
+    Under gateway.multiplex_profiles the turn runs inside
+    ``_profile_runtime_scope`` (contextvar Hermes-home override). The
+    refresh used to read the module-global ``_hermes_home`` — the default
+    profile — so a secondary profile's ``fallback_providers`` never reached
+    its sessions and auth errors (401/403) aborted instead of failing over.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from gateway.run import GatewayRunner
+
+    default_home = tmp_path / "default"
+    profile_home = tmp_path / "profiles" / "codex-profile"
+    default_home.mkdir()
+    profile_home.mkdir(parents=True)
+    # Default profile deliberately has NO fallback chain.
+    (default_home / "config.yaml").write_text("model:\n  default: glm-5.3-flash\n")
+    (profile_home / "config.yaml").write_text(
+        "fallback_providers:\n"
+        "  - provider: zai\n"
+        "    model: glm-5.3-flash\n"
+    )
+    monkeypatch.setattr("gateway.run._hermes_home", default_home)
+
+    runner = SimpleNamespace(_fallback_model=None)
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        chain = bound()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert chain == [{"provider": "zai", "model": "glm-5.3-flash"}]
+
+    # Outside the scope (no override) the default profile's config applies.
+    assert bound() is None
+
+
 def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):
     """_load_fallback_model remains a pure static reader used by refresh."""
     from gateway.run import GatewayRunner

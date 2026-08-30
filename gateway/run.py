@@ -9841,7 +9841,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from hermes_cli.config import read_user_config_raw
-            cfg_path = _hermes_home / "config.yaml"
+            # Resolve via _gateway_config_home() (multiplex-override aware),
+            # not the module-global _hermes_home. Under
+            # gateway.multiplex_profiles the turn runs inside
+            # _profile_runtime_scope, and the secondary profile's own
+            # config.yaml is where its fallback_providers live. Reading the
+            # default profile's config here silently dropped the profile's
+            # chain, so auth errors (401/403) on the profile's backend
+            # aborted as "Non-retryable client error" instead of failing
+            # over to the configured fallback provider.
+            cfg_path = _gateway_config_home() / "config.yaml"
             if not cfg_path.exists():
                 self._fallback_model = None
                 return self._fallback_model
