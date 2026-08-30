@@ -4533,6 +4533,22 @@ class AIAgent:
         except Exception:
             pass
 
+        # Close the Codex app-server session. It is an LLM-client-class
+        # resource: a ~165MB subprocess that ALSO holds the codex thread's
+        # writer lock. Leaving it alive on soft evict leaked one app-server
+        # per eviction (observed accumulating every few minutes on a busy
+        # multiplex gateway) and made the next instance's thread/resume
+        # fail with "already has an active writer". Context is NOT lost:
+        # the thread id is recorded in agent.codex_thread_registry and the
+        # rebuilt agent resumes it from the rollout on disk.
+        try:
+            codex_session = getattr(self, "_codex_session", None)
+            if codex_session is not None:
+                self._codex_session = None
+                codex_session.close()
+        except Exception:
+            pass
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 

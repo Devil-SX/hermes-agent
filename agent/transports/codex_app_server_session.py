@@ -282,6 +282,7 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        resume_thread_id: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -299,6 +300,17 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        # Codex thread to resume on first start (from the Hermes-side
+        # session_id -> thread registry in agent.codex_thread_registry).
+        # Consumed on the first ensure_started() attempt; a rejected resume
+        # falls back to thread/start so the turn never hard-fails on a
+        # stale pointer.
+        self._resume_thread_id = (resume_thread_id or "").strip() or None
+        # True when the active thread was RESUMED (full history restored
+        # from the codex rollout); False for a freshly started thread. The
+        # caller uses this to decide whether to inject a bounded
+        # recent-history block into the thread's first turn.
+        self.thread_resumed: bool = False
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
@@ -327,6 +339,48 @@ class CodexAppServerSession:
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
         )
+        # Resume the thread the previous agent instance for this Hermes
+        # session was using, when we have one on record. The cached AIAgent
+        # that owned the old CodexAppServerSession is routinely destroyed
+        # mid-conversation (gateway agent-cache eviction, gateway restart),
+        # and the codex thread is the ONLY place this runtime's conversation
+        # history lives — without resume, every rebuild restarted the
+        # conversation from zero while the chat-completions runtime replayed
+        # its persisted transcript. Fail-open: a rejected resume (rollout
+        # gone, codex downgrade, stale writer lock) falls back to a fresh
+        # thread/start, and the caller injects a bounded recent-history
+        # block into that thread's first turn instead.
+        if self._resume_thread_id is not None:
+            resume_id = self._resume_thread_id
+            self._resume_thread_id = None  # one attempt only
+            try:
+                result = self._client.request(
+                    "thread/resume", {"threadId": resume_id}, timeout=15
+                )
+            except (CodexAppServerError, TimeoutError) as exc:
+                logger.info(
+                    "codex app-server thread/resume rejected for %s (%s) — "
+                    "falling back to thread/start",
+                    resume_id[:8],
+                    exc,
+                )
+            else:
+                thread_obj = result.get("thread") or {}
+                thread_id = (
+                    thread_obj.get("id")
+                    or thread_obj.get("sessionId")
+                    or result.get("sessionId")
+                    or result.get("threadId")
+                    or resume_id
+                )
+                self._thread_id = thread_id
+                self.thread_resumed = True
+                logger.info(
+                    "codex app-server thread resumed: id=%s cwd=%s",
+                    str(thread_id)[:8],
+                    self._cwd,
+                )
+                return self._thread_id
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
         #   1. `thread/start.permissions` is gated behind the experimentalApi

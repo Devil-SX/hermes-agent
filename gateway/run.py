@@ -20981,9 +20981,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # above), matching this function's documented contract.  Refreshing
             # here makes the guard fire only on a DIFFERENT process's writes.
             # Fail-safe inside the helper.
-            await self._refresh_agent_cache_message_count(
-                session_key, session_entry.session_id
-            )
+            #
+            # Multiplex scope: the coherence guard this re-baselines runs
+            # inside _run_agent_inner — i.e. under the turn's
+            # _profile_runtime_scope — so it reads the PROFILE's state.db,
+            # which is also where the agent's transcript flush lands. This
+            # call site runs in the dispatch task's DEFAULT scope; without
+            # re-entering the profile scope here the snapshot is taken from
+            # the wrong DB (the default profile's same-named session row),
+            # the counts then mismatch on the very next turn, and the guard
+            # evicts the cached agent after EVERY turn of EVERY multiplexed
+            # profile — destroying prompt caching and, for the codex
+            # app-server runtime, forcing a fresh subprocess+thread per
+            # message.
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                with _profile_runtime_scope(
+                    self._resolve_profile_home_for_source(source)
+                ):
+                    await self._refresh_agent_cache_message_count(
+                        session_key, session_entry.session_id
+                    )
+            else:
+                await self._refresh_agent_cache_message_count(
+                    session_key, session_entry.session_id
+                )
 
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
