@@ -395,21 +395,25 @@ Effective on the next session. The Codex managed block stays in `~/.codex/config
 Codex keeps each thread's working context — the files it has read, command
 output, plan state, everything built up over a long task — **inside the Codex
 thread**, not in Hermes' message transcript. Hermes therefore pins **one Codex
-thread per session** and **resumes** it on every turn (`thread/resume`) so that
-context carries across messages.
+thread per session** and uses `thread/resume` whenever its cached agent must be
+rebuilt, so context carries across messages.
 
-This matters most under the **gateway** (Discord / Telegram / etc.), which
-builds a fresh `AIAgent` per inbound message. Without resume, every message
-would call `thread/start` and hand the model an *empty* thread, so a multi-turn
-task ("do X" → "now continue" → "what did you find?") would silently lose all of
-its earlier work. The thread id is remembered per session — keyed so it survives
-context-compaction's session-id rotation — and replayed as the resume target.
+This matters most under the **gateway** (Discord / Telegram / etc.). Its cached
+`AIAgent` can be rebuilt after a gateway restart, cache eviction, configuration
+change, or session switch. Without resume, that rebuild would call
+`thread/start` and hand the model an *empty* thread, so a multi-turn task ("do
+X" → "now continue" → "what did you find?") could silently lose all earlier
+work. The thread id lives in the existing `SessionEntry.metadata` routing row
+in `state.db`, keyed by the stable gateway session key, and is restored onto the
+rebuilt agent. No separate Codex session registry is required.
 
 Resume degrades gracefully: if the rollout is no longer on disk, or the Codex
 build is too old to expose `thread/resume`, Hermes falls back to `thread/start`
 for that turn (a fresh thread) rather than failing. The mapping is dropped on
 explicit conversation boundaries (`/new`, auto-reset, session expiry), so a
-brand-new conversation always starts a brand-new Codex thread.
+brand-new conversation always starts a brand-new Codex thread. Each app-server
+connection performs the `initialize` handshake exactly once; a failed startup
+connection is discarded before retrying.
 
 ## Limitations
 

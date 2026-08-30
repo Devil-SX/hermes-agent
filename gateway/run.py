@@ -5879,6 +5879,12 @@ class TurnRunner:
         agent.reasoning_config = reasoning_config
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
+        # The gateway's existing SessionEntry metadata is the durable source
+        # of truth for Codex continuity. A fresh/rebuilt agent consumes it on
+        # first app-server use; a cached agent keeps its live connection when
+        # the ids already match.
+        if ctx.codex_resume_thread_id:
+            agent._codex_resume_thread_id = ctx.codex_resume_thread_id
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
@@ -6714,6 +6720,11 @@ class TurnRunner:
             # self-persisted (it didn't — see codex_runtime.py).  Default
             # True preserves the skip-db behaviour for the standard runtime.
             "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
+            "codex_thread_id": (
+                ctx.result_holder[0].get("codex_thread_id")
+                if ctx.result_holder[0]
+                else None
+            ),
         }
 
 
@@ -20475,6 +20486,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
+            # Persist Codex continuity only after the generation guard. A
+            # stale turn unwinding after /new must never repopulate metadata
+            # on the fresh SessionEntry.
+            codex_thread_id = str(
+                agent_result.get("codex_thread_id") or ""
+            ).strip()
+            if session_key and codex_thread_id:
+                try:
+                    await self.async_session_store.set_session_metadata(
+                        session_key,
+                        "codex_thread_id",
+                        codex_thread_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to persist Codex thread id for %s",
+                        session_key,
+                        exc_info=True,
+                    )
+
             response = agent_result.get("final_response") or ""
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
@@ -24728,11 +24759,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=self._session_cwd_for_context(context),
             async_delivery=_async_delivery,
             cron_session="",
         )
+
+    def _session_cwd_for_context(self, context: SessionContext) -> str:
+        """Resolve ``terminal.cwd`` for the routed profile without env bleed.
+
+        Single-profile gateways retain the process bootstrap bridge. A
+        multiplexer must read the selected profile's config directly: the
+        process-global ``TERMINAL_CWD`` belongs to the launch profile and is
+        not a valid fallback for another profile.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return ""
+
+        profile_home = self._resolve_profile_home_for_source(context.source)
+        profile_config = _load_gateway_config(profile_home / "config.yaml")
+        terminal = profile_config.get("terminal") or {}
+        if not isinstance(terminal, dict):
+            terminal = {}
+        configured_cwd = str(terminal.get("cwd") or "").strip()
+        terminal_backend = str(terminal.get("backend") or "local")
+        resolved = resolve_placeholder_terminal_cwd(
+            configured_cwd=configured_cwd,
+            terminal_backend=terminal_backend,
+            # MESSAGING_CWD is process-global and therefore never a valid
+            # secondary-profile fallback.
+            messaging_cwd=None,
+            docker_mount_cwd_to_workspace=bool(
+                terminal.get("docker_mount_cwd_to_workspace", False)
+            ),
+            home_fallback=str(Path.home()),
+        )
+        # Non-local placeholder configurations intentionally return None for
+        # terminal execution. Codex app-server still requires a host cwd, so
+        # pin the neutral user home rather than leaking the launch profile's
+        # TERMINAL_CWD into this session.
+        return resolved or str(Path.home())
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
@@ -28169,6 +28237,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        codex_resume_thread_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28179,6 +28248,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        if codex_resume_thread_id is None and session_key:
+            try:
+                codex_resume_thread_id = await self.async_session_store.get_session_metadata(
+                    session_key,
+                    "codex_thread_id",
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to restore Codex thread id for %s",
+                    session_key,
+                    exc_info=True,
+                )
+
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
@@ -28189,6 +28271,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                codex_resume_thread_id=codex_resume_thread_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28202,6 +28285,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                codex_resume_thread_id=codex_resume_thread_id,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28345,6 +28429,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        codex_resume_thread_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28647,6 +28732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             channel_prompt=channel_prompt,
             session_id=session_id,
             session_key=session_key,
+            codex_resume_thread_id=codex_resume_thread_id,
             run_generation=run_generation,
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
@@ -29885,6 +29971,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    codex_resume_thread_id=(
+                        (result or {}).get("codex_thread_id")
+                        or codex_resume_thread_id
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

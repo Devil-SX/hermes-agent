@@ -1,5 +1,6 @@
 import asyncio
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -74,6 +75,52 @@ def test_set_session_env_sets_contextvars(monkeypatch):
 
     # Clean up
     runner._clear_session_env(tokens)
+
+
+def test_multiplex_session_uses_routed_profile_terminal_cwd(monkeypatch, tmp_path):
+    """A secondary profile must not inherit the launch profile's cwd."""
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    launch_cwd = tmp_path / "launch-profile"
+    routed_cwd = tmp_path / "research-workspace"
+    profile_home = tmp_path / "profiles" / "research"
+    launch_cwd.mkdir()
+    routed_cwd.mkdir()
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        f"terminal:\n  backend: local\n  cwd: {routed_cwd}\n",
+        encoding="utf-8",
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    monkeypatch.setattr(
+        runner,
+        "_resolve_profile_home_for_source",
+        lambda _source: profile_home,
+    )
+    monkeypatch.setenv("TERMINAL_CWD", str(launch_cwd))
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="thread",
+        thread_id="42",
+        profile="research",
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:research:telegram:thread:-1001:42",
+        session_id="session-research-1",
+    )
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert resolve_agent_cwd() == routed_cwd
+        assert get_session_env("HERMES_SESSION_ID") == "session-research-1"
+    finally:
+        runner._clear_session_env(tokens)
 
 
 def test_clear_session_env_restores_previous_state(monkeypatch):
@@ -272,4 +319,3 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
 
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
-

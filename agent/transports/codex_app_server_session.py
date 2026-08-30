@@ -300,17 +300,12 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
-        # Codex thread to resume on first start (from the Hermes-side
-        # session_id -> thread registry in agent.codex_thread_registry).
+        # Codex thread to resume on first start (restored by the gateway from
+        # the current SessionEntry metadata).
         # Consumed on the first ensure_started() attempt; a rejected resume
         # falls back to thread/start so the turn never hard-fails on a
         # stale pointer.
         self._resume_thread_id = (resume_thread_id or "").strip() or None
-        # True when the active thread was RESUMED (full history restored
-        # from the codex rollout); False for a freshly started thread. The
-        # caller uses this to decide whether to inject a bounded
-        # recent-history block into the thread's first turn.
-        self.thread_resumed: bool = False
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
@@ -334,11 +329,23 @@ class CodexAppServerSession:
             self._client = self._client_factory(
                 codex_bin=self._codex_bin, codex_home=self._codex_home
             )
-        self._client.initialize(
-            client_name="hermes",
-            client_title="Hermes Agent",
-            client_version=_get_hermes_version(),
-        )
+        try:
+            self._client.initialize(
+                client_name="hermes",
+                client_title="Hermes Agent",
+                client_version=_get_hermes_version(),
+            )
+            return self._resume_or_start_thread()
+        except Exception:
+            # initialize is legal exactly once per app-server connection. If
+            # any later startup step fails, discard this initialized client so
+            # a retry cannot send a second initialize on the same connection.
+            self._discard_startup_client()
+            raise
+
+    def _resume_or_start_thread(self) -> str:
+        """Resume the durable thread or start a fresh one on an initialized client."""
+        assert self._client is not None
         # Resume the thread the previous agent instance for this Hermes
         # session was using, when we have one on record. The cached AIAgent
         # that owned the old CodexAppServerSession is routinely destroyed
@@ -348,8 +355,7 @@ class CodexAppServerSession:
         # conversation from zero while the chat-completions runtime replayed
         # its persisted transcript. Fail-open: a rejected resume (rollout
         # gone, codex downgrade, stale writer lock) falls back to a fresh
-        # thread/start, and the caller injects a bounded recent-history
-        # block into that thread's first turn instead.
+        # thread/start for the current turn.
         if self._resume_thread_id is not None:
             resume_id = self._resume_thread_id
             self._resume_thread_id = None  # one attempt only
@@ -357,7 +363,7 @@ class CodexAppServerSession:
                 result = self._client.request(
                     "thread/resume", {"threadId": resume_id}, timeout=15
                 )
-            except (CodexAppServerError, TimeoutError) as exc:
+            except (CodexAppServerError, TimeoutError, RuntimeError) as exc:
                 logger.info(
                     "codex app-server thread/resume rejected for %s (%s) — "
                     "falling back to thread/start",
@@ -374,7 +380,6 @@ class CodexAppServerSession:
                     or resume_id
                 )
                 self._thread_id = thread_id
-                self.thread_resumed = True
                 logger.info(
                     "codex app-server thread resumed: id=%s cwd=%s",
                     str(thread_id)[:8],
@@ -425,6 +430,17 @@ class CodexAppServerSession:
             self._cwd,
         )
         return self._thread_id
+
+    def _discard_startup_client(self) -> None:
+        """Retire a partially started connection without closing the session."""
+        client = self._client
+        self._client = None
+        self._thread_id = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def close(self) -> None:
         if self._closed:
@@ -547,7 +563,7 @@ class CodexAppServerSession:
         result = TurnResult()
         try:
             self.ensure_started()
-        except (CodexAppServerError, TimeoutError) as exc:
+        except (CodexAppServerError, TimeoutError, RuntimeError) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
             )

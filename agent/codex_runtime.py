@@ -26,60 +26,6 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 
 logger = logging.getLogger(__name__)
 
-# Fresh-thread context injection bounds. When a codex thread is started
-# from scratch (no resumable thread on record, or resume rejected), the
-# model would otherwise see ONLY the current user message — unlike the
-# chat-completions runtime, which replays the persisted transcript every
-# turn. Prepend a bounded tail of the Hermes-side history to the first
-# turn of the fresh thread instead.
-_FRESH_THREAD_CONTEXT_MAX_MESSAGES = 16
-_FRESH_THREAD_CONTEXT_MAX_CHARS = 6000
-_FRESH_THREAD_CONTEXT_PER_MESSAGE_CHARS = 800
-
-
-def _build_fresh_thread_context_prefix(messages: List[Dict[str, Any]]) -> str:
-    """Render a bounded recent-history block for a fresh codex thread.
-
-    ``messages`` is the live conversation list at turn start; its last
-    entry is the current user turn (already appended by run_conversation),
-    which is excluded — codex receives it as the actual turn input. Only
-    plain user/assistant text rows are used; tool calls/results and empty
-    rows are skipped to stay inside the char budget.
-    """
-    if not isinstance(messages, list) or len(messages) < 2:
-        return ""
-    rows: list[str] = []
-    total = 0
-    for msg in reversed(messages[:-1]):
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        if role not in {"user", "assistant"}:
-            continue
-        content = msg.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        text = content.strip()
-        if len(text) > _FRESH_THREAD_CONTEXT_PER_MESSAGE_CHARS:
-            text = text[:_FRESH_THREAD_CONTEXT_PER_MESSAGE_CHARS] + " …[truncated]"
-        line = f"{'User' if role == 'user' else 'Assistant'}: {text}"
-        if total + len(line) > _FRESH_THREAD_CONTEXT_MAX_CHARS:
-            break
-        rows.append(line)
-        total += len(line)
-        if len(rows) >= _FRESH_THREAD_CONTEXT_MAX_MESSAGES:
-            break
-    if not rows:
-        return ""
-    rows.reverse()
-    return (
-        "[Earlier conversation in this chat — context only, oldest first. "
-        "Answer the current message below; use this history only as background.]\n"
-        + "\n\n".join(rows)
-        + "\n\n[Current message]\n"
-    )
-
-
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
     """Return the serialized request size and exception class chain.
 
@@ -748,6 +694,28 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
+    # A cached agent normally keeps one live app-server session. If the
+    # gateway restored a different durable thread id (for example after a
+    # session switch), retire the stale connection before creating the next
+    # session. Matching ids keep the live subprocess and prompt state intact.
+    raw_resume_thread_id = getattr(agent, "_codex_resume_thread_id", None)
+    resume_thread_id = (
+        raw_resume_thread_id.strip()
+        if isinstance(raw_resume_thread_id, str) and raw_resume_thread_id.strip()
+        else None
+    )
+    live_session = getattr(agent, "_codex_session", None)
+    if (
+        live_session is not None
+        and resume_thread_id
+        and getattr(live_session, "_thread_id", None) not in (None, resume_thread_id)
+    ):
+        try:
+            live_session.close()
+        except Exception:
+            pass
+        agent._codex_session = None
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
@@ -793,21 +761,6 @@ def run_codex_app_server_turn(
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
         #
-        # Resume the codex thread the previous agent instance for this
-        # Hermes session was using (agent.codex_thread_registry). The
-        # cached AIAgent owning the old session is routinely evicted /
-        # rebuilt mid-conversation, and the codex thread is the ONLY place
-        # this runtime's history lives — without resume every rebuild
-        # restarted the conversation from zero.
-        _resume_thread_id = None
-        try:
-            from agent.codex_thread_registry import lookup_thread_id
-
-            _resume_thread_id = lookup_thread_id(
-                getattr(agent, "session_id", None)
-            )
-        except Exception:
-            logger.debug("codex thread registry lookup failed", exc_info=True)
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
@@ -816,40 +769,15 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
-            resume_thread_id=_resume_thread_id,
+            resume_thread_id=resume_thread_id,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
-    # Start the thread eagerly so we know whether the conversation history
-    # was restored (thread/resume) before composing the turn input. On a
-    # FRESH thread, inject a bounded tail of the Hermes-side history —
-    # the codex thread is the only context this runtime ever sends, so
-    # without this the model sees just the current message while the
-    # chat-completions runtime replays its full transcript.
-    _turn_input = user_message
     try:
-        agent._codex_session.ensure_started()
-        if not agent._codex_session.thread_resumed and isinstance(
-            user_message, str
-        ):
-            _history_prefix = _build_fresh_thread_context_prefix(messages)
-            if _history_prefix:
-                _turn_input = f"{_history_prefix}{user_message}"
-                logger.info(
-                    "codex app-server fresh thread: injected %d chars of "
-                    "recent Hermes history into the first turn",
-                    len(_history_prefix),
-                )
-    except Exception:
-        # Startup failures are surfaced by run_turn below with the normal
-        # error rendering — don't double-handle them here.
-        logger.debug("codex pre-turn ensure_started raised", exc_info=True)
-
-    try:
-        turn = agent._codex_session.run_turn(user_input=_turn_input)
+        turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -885,6 +813,7 @@ def run_codex_app_server_turn(
                 else {}
             ),
             "error": str(exc),
+            "codex_thread_id": resume_thread_id,
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
@@ -898,6 +827,11 @@ def run_codex_app_server_turn(
     )
     if _user_interrupted:
         agent.clear_interrupt()
+
+    # Keep the durable id on the agent as well as in the gateway result. This
+    # covers CLI reuse and a should-retire respawn within the same AIAgent.
+    if turn.thread_id:
+        agent._codex_resume_thread_id = turn.thread_id
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
@@ -914,19 +848,6 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
-
-    # Record the codex thread this Hermes session is using so the NEXT
-    # agent instance for the same session (cache eviction, gateway
-    # restart) can resume it via thread/resume instead of starting the
-    # conversation over. Best-effort; a lost pointer falls back to the
-    # fresh-thread history injection above.
-    if getattr(turn, "thread_id", None):
-        try:
-            from agent.codex_thread_registry import record_thread_id
-
-            record_thread_id(getattr(agent, "session_id", None), turn.thread_id)
-        except Exception:
-            logger.debug("codex thread registry record failed", exc_info=True)
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which

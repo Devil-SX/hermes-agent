@@ -3023,8 +3023,11 @@ class SessionStore:
             if entry is None:
                 return False
             entry.metadata[key] = value
-            self._save()
-            return True
+        # One small metadata field should not rewrite the whole routing index.
+        # The single-entry path persists to state.db (and the optional legacy
+        # mirror) with the same generation ordering as update_session().
+        self._save_entry(session_key)
+        return True
 
     def set_model_override(
         self, session_key: str, override: Optional[Dict[str, Any]]

@@ -4538,9 +4538,9 @@ class AIAgent:
         # writer lock. Leaving it alive on soft evict leaked one app-server
         # per eviction (observed accumulating every few minutes on a busy
         # multiplex gateway) and made the next instance's thread/resume
-        # fail with "already has an active writer". Context is NOT lost:
-        # the thread id is recorded in agent.codex_thread_registry and the
-        # rebuilt agent resumes it from the rollout on disk.
+        # fail with "already has an active writer". Context is NOT lost: the
+        # gateway stores the thread id in the current SessionEntry metadata,
+        # and the rebuilt agent resumes it from the rollout on disk.
         try:
             codex_session = getattr(self, "_codex_session", None)
             if codex_session is not None:

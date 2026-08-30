@@ -1291,6 +1291,57 @@ class TestSessionMetadata:
             == "123.456"
         )
 
+    def test_codex_thread_metadata_survives_db_only_restart(self, tmp_path):
+        """Codex continuity uses state.db even when sessions.json is disabled."""
+        config = GatewayConfig(write_sessions_json=False)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="thread",
+            thread_id="42",
+            profile="research",
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+
+        assert store.set_session_metadata(
+            entry.session_key,
+            "codex_thread_id",
+            "thread-codex-1",
+        )
+        assert not (tmp_path / "sessions.json").exists()
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        assert restarted.get_session_metadata(
+            entry.session_key,
+            "codex_thread_id",
+        ) == "thread-codex-1"
+        restarted._db.close()
+
+    def test_explicit_reset_clears_codex_thread_metadata(self, tmp_path):
+        config = GatewayConfig()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="thread",
+            thread_id="42",
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+        assert store.set_session_metadata(
+            entry.session_key,
+            "codex_thread_id",
+            "thread-codex-1",
+        )
+
+        store.reset_session(entry.session_key)
+
+        assert store.get_session_metadata(
+            entry.session_key,
+            "codex_thread_id",
+        ) is None
+
     def test_metadata_write_does_not_touch_activity_clock(self, tmp_path):
         """set_session_metadata is bookkeeping — it must not bump updated_at.
 
@@ -1642,5 +1693,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

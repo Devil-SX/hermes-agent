@@ -34,6 +34,7 @@ class FakeClient:
         self.responses: list[tuple[Any, dict]] = []
         self.error_responses: list[tuple[Any, int, str]] = []
         self._initialized = False
+        self.initialize_calls = 0
         self._closed = False
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
@@ -41,6 +42,9 @@ class FakeClient:
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
+        self.initialize_calls += 1
+        if self.initialize_calls > 1:
+            raise RuntimeError("already initialized")
         self._initialized = True
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
@@ -946,6 +950,33 @@ class TestThreadResume:
         s = make_session(client, resume_thread_id="whatever")
         assert s.ensure_started() == "alias-resumed"
 
+    def test_failed_start_discards_initialized_client_before_retry(self):
+        """A retry must use a fresh connection, never initialize twice."""
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        first = FakeClient()
+        second = FakeClient()
+
+        def fail_first_start(method, params):
+            if method == "thread/start":
+                raise CodexAppServerError(code=-32603, message="bad cwd")
+            return {}
+
+        first._request_handler = fail_first_start
+        clients = iter((first, second))
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=lambda **_kwargs: next(clients),
+        )
+
+        with pytest.raises(CodexAppServerError, match="bad cwd"):
+            session.ensure_started()
+
+        assert first._closed is True
+        assert first.initialize_calls == 1
+        assert session.ensure_started() == "thread-fake-001"
+        assert second.initialize_calls == 1
+
 
 # ---- thread/start cross-fill ----
 
@@ -1018,4 +1049,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-
