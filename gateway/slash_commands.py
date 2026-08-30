@@ -5453,6 +5453,130 @@ class GatewaySlashCommandsMixin:
             return "\n".join(parts)
         return t("gateway.usage.no_data")
 
+    async def _handle_statics_command(self, event: MessageEvent) -> str:
+        """Handle /statics -- layered token statistics from the session store.
+
+        Three sections in one message (MarkdownV2, the Telegram adapter's
+        parse mode): ① user-input character stats, ② topic distribution,
+        ③ backend (provider/model) distribution. Aggregated from
+        SessionDB.sessions over the last `days` (default 7; /statics 30).
+        """
+        import html
+        import sqlite3
+        import time as _time
+
+        args = event.get_command_args().strip()
+        days = 7
+        if args:
+            try:
+                days = max(1, min(int(args.split()[0]), 90))
+            except ValueError:
+                pass
+
+        db = getattr(self, "_session_db", None)
+        db_path = getattr(db, "db_path", None)
+        if not db_path or not db_path.exists():
+            return "📊 _statics: 会话库不可用_"
+
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        since = _time.time() - days * 86400
+        try:
+            rows = con.execute(
+                "SELECT COALESCE(billing_provider,'?') AS p, COALESCE(model,'-') AS m, "
+                "COALESCE(NULLIF(title,''),'(untitled)') AS t, chat_type, "
+                "SUM(input_tokens) AS it, SUM(output_tokens) AS ot, "
+                "SUM(cache_read_tokens) AS crt, SUM(api_call_count) AS calls, "
+                "COUNT(*) AS n FROM sessions WHERE started_at > ? "
+                "GROUP BY p, m, t, chat_type",
+                (since,),
+            ).fetchall()
+        except sqlite3.Error:
+            con.close()
+            return "📊 _statics: 查询失败_"
+        con.close()
+
+        if not rows:
+            return "📊 _近 {days} 天暂无用量数据_"
+
+        def _fmt(n):
+            n = n or 0
+            if n >= 1e9:
+                return f"{n/1e9:.2f}B"
+            if n >= 1e6:
+                return f"{n/1e6:.2f}M"
+            if n >= 1e3:
+                return f"{n/1e3:.1f}K"
+            return str(n)
+
+        tot_in = sum(r["it"] or 0 for r in rows)
+        tot_out = sum(r["ot"] or 0 for r in rows)
+        tot_cr = sum(r["crt"] or 0 for r in rows)
+        calls = sum(r["calls"] or 0 for r in rows)
+        hit = tot_cr / (tot_cr + tot_in) * 100 if (tot_cr + tot_in) else 0
+
+        L = []
+        L.append(f"📊 *Alfred 用量统计* _· 近 {days} 天_")
+        L.append(f"> 总消耗 *{_fmt(tot_in + tot_out)}* tokens")
+        L.append(f"> 输入 {_fmt(tot_in)} · 输出 {_fmt(tot_out)} · 缓存读 {_fmt(tot_cr)} · 请求 {calls:,}")
+
+        # ① user-input character stats (from the current session's transcript)
+        user_chars = 0
+        try:
+            session_entry = await self.async_session_store.get_or_create_session(event.source)
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+            for m in history or []:
+                if m.get("role") == "user" and m.get("content"):
+                    user_chars += len(str(m.get("content")))
+        except Exception:
+            user_chars = 0
+        L.append("")
+        L.append("💬 *用户输入*")
+        L.append(f"> 本会话累计输入 `{user_chars:,}` 字符")
+        if user_chars:
+            L.append(f"> 平均每轮 ~`{user_chars // max(1, len(history or [])):,}` 字符")
+
+        # ② topic distribution
+        from collections import defaultdict
+        by_topic = defaultdict(lambda: {"it": 0, "ot": 0, "calls": 0})
+        for r in rows:
+            k = ("👥 " if r["chat_type"] == "group" else "🗂 ") + r["t"]
+            by_topic[k]["it"] += r["it"] or 0
+            by_topic[k]["ot"] += r["ot"] or 0
+            by_topic[k]["calls"] += r["calls"] or 0
+        total_main = tot_in + tot_out
+        L.append("")
+        L.append("🗂 *会话分布 Top 6*")
+        for name, v in sorted(by_topic.items(), key=lambda kv: kv[1]["it"] + kv[1]["ot"], reverse=True)[:6]:
+            t = v["it"] + v["ot"]
+            share = t / total_main * 100 if total_main else 0
+            bar = "█" * max(1, round(share / 8))
+            L.append(f"`{bar.ljust(13)}` *{_fmt(t)}* · {html.escape(name)}")
+            L.append(f"  _`{_fmt(v['it'])}` in / `{_fmt(v['ot'])}` out / {v['calls']} calls_")
+
+        # ③ backend distribution
+        from collections import defaultdict as _dd2
+        by_be = _dd2(lambda: {"it": 0, "ot": 0, "cr": 0, "calls": 0})
+        for r in rows:
+            k = f"{r['p']}/{r['m']}"
+            by_be[k]["it"] += r["it"] or 0
+            by_be[k]["ot"] += r["ot"] or 0
+            by_be[k]["cr"] += r["crt"] or 0
+            by_be[k]["calls"] += r["calls"] or 0
+        L.append("")
+        L.append("🔌 *Backend 分布*")
+        for k, v in sorted(by_be.items(), key=lambda kv: kv[1]["it"] + kv[1]["ot"], reverse=True)[:6]:
+            t = v["it"] + v["ot"]
+            share = t / total_main * 100 if total_main else 0
+            bar = "█" * max(1, round(share / 8))
+            hitr = v["cr"] / (v["cr"] + v["it"]) * 100 if (v["cr"] + v["it"]) else 0
+            L.append(f"`{bar.ljust(13)}` *{_fmt(t)}* · {html.escape(k)}")
+            L.append(f"  _hit {hitr:.0f}% / {v['calls']} calls_")
+
+        L.append("")
+        L.append(f"_token = 输入+输出；缓存不计入柱量_")
+        return "\n".join(L)
+
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""
         args = event.get_command_args().strip()
