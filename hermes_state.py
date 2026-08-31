@@ -9256,6 +9256,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return {"tokens": int(row[0] or 0), "cost_usd": float(row[1] or 0.0)}
 
+    def session_usage_breakdown(self, *, started_after: float) -> List[Dict[str, Any]]:
+        """Return aggregate session usage through the owned read interface.
+
+        Gateway commands must not open a second connection to the live session
+        database. This method keeps the query behind ``SessionDB``'s read
+        context, and ``AsyncSessionDB`` automatically offloads it for callers
+        on the gateway event loop.
+        """
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(billing_provider, '?') AS p,
+                       COALESCE(model, '-') AS m,
+                       COALESCE(NULLIF(title, ''), '(untitled)') AS t,
+                       chat_type,
+                       SUM(input_tokens) AS it,
+                       SUM(output_tokens) AS ot,
+                       SUM(cache_read_tokens) AS crt,
+                       SUM(api_call_count) AS calls,
+                       COUNT(*) AS n
+                  FROM sessions
+                 WHERE started_at > ?
+                 GROUP BY p, m, t, chat_type
+                """,
+                (started_after,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_sessions_rich(
         self,
         source: str = None,

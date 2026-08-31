@@ -5458,12 +5458,11 @@ class GatewaySlashCommandsMixin:
 
         Three sections in one message (MarkdownV2, the Telegram adapter's
         parse mode): ① user-input character stats, ② topic distribution,
-        ③ backend (provider/model) distribution. Aggregated from
-        SessionDB.sessions over the last `days` (default 7; /statics 30).
+        ③ backend (provider/model) distribution. Aggregated through the
+        gateway-owned AsyncSessionDB read facade over the last `days`
+        (default 7; /statics 30).
         """
         import html
-        import sqlite3
-        import time as _time
 
         args = event.get_command_args().strip()
         days = 7
@@ -5474,30 +5473,18 @@ class GatewaySlashCommandsMixin:
                 pass
 
         db = getattr(self, "_session_db", None)
-        db_path = getattr(db, "db_path", None)
-        if not db_path or not db_path.exists():
+        if db is None:
             return "📊 _statics: 会话库不可用_"
 
-        con = sqlite3.connect(db_path)
-        con.row_factory = sqlite3.Row
-        since = _time.time() - days * 86400
+        since = time.time() - days * 86400
         try:
-            rows = con.execute(
-                "SELECT COALESCE(billing_provider,'?') AS p, COALESCE(model,'-') AS m, "
-                "COALESCE(NULLIF(title,''),'(untitled)') AS t, chat_type, "
-                "SUM(input_tokens) AS it, SUM(output_tokens) AS ot, "
-                "SUM(cache_read_tokens) AS crt, SUM(api_call_count) AS calls, "
-                "COUNT(*) AS n FROM sessions WHERE started_at > ? "
-                "GROUP BY p, m, t, chat_type",
-                (since,),
-            ).fetchall()
-        except sqlite3.Error:
-            con.close()
+            rows = await db.session_usage_breakdown(started_after=since)
+        except Exception:
+            logger.exception("Statics command session usage query failed")
             return "📊 _statics: 查询失败_"
-        con.close()
 
         if not rows:
-            return "📊 _近 {days} 天暂无用量数据_"
+            return f"📊 _近 {days} 天暂无用量数据_"
 
         def _fmt(n):
             n = n or 0
