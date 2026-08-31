@@ -711,6 +711,70 @@ class TestSessionRetirement:
       - dead subprocess detection between iterations
     """
 
+    def test_default_turn_lifecycle_allows_multi_hour_goal(self, monkeypatch):
+        """The protocol completion event, not a 600s wall clock, owns success.
+
+        Advance a fake monotonic clock by three hours between a tool result
+        and the final response.  No real sleep is involved; this pins both
+        long-turn defaults (no absolute deadline and no silence watchdog).
+        """
+        clock = [1_000.0]
+
+        class MultiHourClient(FakeClient):
+            def take_notification(self, timeout: float = 0.0):
+                if self._notifications:
+                    note = self._notifications.pop(0)
+                    clock[0] += float(
+                        (note.get("params") or {}).pop("advanceClock", 0.0)
+                    )
+                    return note
+                return None
+
+        client = MultiHourClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "ex-long",
+                "command": "run goal",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "phase complete",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="t",
+            turnId="tu1",
+            advanceClock=3_601.0,
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m-long", "text": "Goal 已完成"},
+            threadId="t",
+            turnId="tu1",
+            advanceClock=7_200.0,
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock[0])
+
+        result = make_session(client).run_turn(
+            "work until the goal is complete",
+            notification_poll_timeout=0.0,
+        )
+
+        assert clock[0] - 1_000.0 > 10_800.0
+        assert result.final_text == "Goal 已完成"
+        assert result.interrupted is False
+        assert result.error is None
+        assert result.should_retire is False
+        assert not any(
+            method == "turn/interrupt" for method, _params in client.requests
+        )
+
 
 
     def test_final_agent_message_without_turn_completed_is_recovered(self):

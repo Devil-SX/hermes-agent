@@ -541,19 +541,25 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: Optional[float] = None,
         notification_poll_timeout: float = 0.25,
-        post_tool_quiet_timeout: float = 90.0,
+        post_tool_quiet_timeout: Optional[float] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
         into Hermes' messages shape.
 
-        post_tool_quiet_timeout: if codex emits a tool completion and then
-        goes quiet for this many seconds without emitting another item or
-        `turn/completed`, fast-fail and mark the session for retirement.
-        Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
-        so a wedged codex doesn't burn the full turn deadline.
+        ``turn_timeout`` is an opt-in policy ceiling.  The default is no
+        wall-clock deadline: app-server owns the lifecycle and Hermes waits
+        for its explicit ``turn/completed`` event, a user interrupt, or
+        subprocess death.  This is required for Goal turns that legitimately
+        run for hours.
+
+        ``post_tool_quiet_timeout`` is likewise opt-in.  A completed tool can
+        be followed by a long reasoning or sub-agent phase with no projected
+        Telegram activity, so silence alone is not evidence that Codex is
+        wedged.  Deployments that prefer a bounded watchdog may still pass a
+        positive value explicitly.
         """
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
@@ -629,7 +635,11 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
-        deadline = time.monotonic() + turn_timeout
+        deadline = (
+            None
+            if turn_timeout is None
+            else time.monotonic() + max(float(turn_timeout), 0.0)
+        )
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
@@ -637,7 +647,9 @@ class CodexAppServerSession:
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
 
-        while time.monotonic() < deadline and not turn_complete:
+        while not turn_complete:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -664,7 +676,8 @@ class CodexAppServerSession:
             # signal and codex has been silent past the quiet timeout, give
             # up on this turn instead of waiting for the outer deadline.
             if (
-                last_tool_completion_at is not None
+                post_tool_quiet_timeout is not None
+                and last_tool_completion_at is not None
                 and (time.monotonic() - last_tool_completion_at)
                     > post_tool_quiet_timeout
             ):
@@ -827,11 +840,17 @@ class CodexAppServerSession:
                                 f"turn ended status={turn_status}", err_msg
                             )
 
+        deadline_expired = (
+            not result.interrupted
+            and deadline is not None
+            and time.monotonic() >= deadline
+        )
         if (
             not turn_complete
             and not result.interrupted
             and result.final_text
             and result.error is None
+            and deadline_expired
         ):
             logger.warning(
                 "codex app-server turn reached deadline after a completed "
@@ -849,7 +868,7 @@ class CodexAppServerSession:
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
-                    f"turn timed out after {turn_timeout}s"
+                    f"turn timed out after {float(turn_timeout):g}s"
                 )
             result.should_retire = True
 
