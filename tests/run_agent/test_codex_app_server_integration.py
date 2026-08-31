@@ -843,6 +843,9 @@ class TestCodexToolProgressBridge:
             if on_event:
                 on_event({"method": "item/started", "params": {"item": {
                     "type": "commandExecution", "command": "pytest", "cwd": "/repo"}}})
+            activity_callback = captured_init.get("activity_callback")
+            if activity_callback:
+                activity_callback()
             return TurnResult(final_text="done", projected_messages=[
                 {"role": "assistant", "content": "done"}], turn_id="t1", thread_id="th1")
 
@@ -857,4 +860,7 @@ class TestCodexToolProgressBridge:
             agent.run_conversation("run the tests")
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
+        assert captured_init.get("activity_callback") is not None
+        captured_init["activity_callback"]()
+        assert agent._last_activity_desc == "waiting on Codex app-server turn"
         assert ("tool.started", "exec_command", "pytest") in events

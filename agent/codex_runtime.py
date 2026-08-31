@@ -769,6 +769,9 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            activity_callback=lambda: agent._touch_activity(
+                "waiting on Codex app-server turn"
+            ),
             resume_thread_id=resume_thread_id,
         )
 

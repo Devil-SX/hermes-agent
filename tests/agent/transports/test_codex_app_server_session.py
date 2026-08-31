@@ -761,7 +761,12 @@ class TestSessionRetirement:
         )
         monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock[0])
 
-        result = make_session(client).run_turn(
+        heartbeats = []
+        result = make_session(
+            client,
+            activity_callback=lambda: heartbeats.append(clock[0]),
+            activity_heartbeat_interval=30.0,
+        ).run_turn(
             "work until the goal is complete",
             notification_poll_timeout=0.0,
         )
@@ -771,6 +776,7 @@ class TestSessionRetirement:
         assert result.interrupted is False
         assert result.error is None
         assert result.should_retire is False
+        assert heartbeats == [1_000.0, 4_601.0, 11_801.0]
         assert not any(
             method == "turn/interrupt" for method, _params in client.requests
         )

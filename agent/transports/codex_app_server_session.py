@@ -280,6 +280,8 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        activity_callback: Optional[Callable[[], None]] = None,
+        activity_heartbeat_interval: float = 30.0,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
         resume_thread_id: Optional[str] = None,
@@ -295,6 +297,17 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        # The Gateway has an inactivity watchdog rather than a total-duration
+        # ceiling.  A live app-server turn may legitimately be quiet for a
+        # long time (for example one commandExecution item running a multi-hour
+        # experiment), so renew the parent Agent's activity lease while the
+        # subprocess and turn are both still live.  This is observation only:
+        # user interruption and subprocess-death checks below remain the
+        # authoritative cancellation paths.
+        self._activity_callback = activity_callback
+        self._activity_heartbeat_interval = max(
+            float(activity_heartbeat_interval), 0.0
+        )
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -646,8 +659,28 @@ class CodexAppServerSession:
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
+        next_activity_heartbeat_at = (
+            time.monotonic()
+            if self._activity_callback is not None
+            and self._activity_heartbeat_interval > 0
+            else None
+        )
 
         while not turn_complete:
+            if (
+                next_activity_heartbeat_at is not None
+                and time.monotonic() >= next_activity_heartbeat_at
+            ):
+                try:
+                    self._activity_callback()
+                except Exception:  # pragma: no cover - telemetry is fail-open
+                    logger.debug(
+                        "codex app-server activity callback raised",
+                        exc_info=True,
+                    )
+                next_activity_heartbeat_at = (
+                    time.monotonic() + self._activity_heartbeat_interval
+                )
             if deadline is not None and time.monotonic() >= deadline:
                 break
             if self._interrupt_event.is_set():
