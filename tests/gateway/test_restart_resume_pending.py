@@ -314,6 +314,17 @@ class TestResumePendingSystemNote:
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
 
+    def test_empty_message_interactive_note_reports_and_continues_task(self):
+        """Interactive startup recovery should notify the user without
+        parking the interrupted task behind another prompt."""
+        note = build_resume_recovery_note("restart_timeout", "", interactive=True)
+        assert "automatically resumed" in note
+        assert "CONTINUE the interrupted task" in note
+        assert "Do NOT ask what to do next" in note
+        assert "resume from the first step" in note
+        assert "ask what they would like to do next" not in note
+        assert "skip any unfinished work" not in note
+
 
     def test_resume_note_is_persisted_instead_of_original_empty_message(self):
         """The auto-resume note must not leave an empty row in state.db."""
@@ -1164,5 +1175,4 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-
 
