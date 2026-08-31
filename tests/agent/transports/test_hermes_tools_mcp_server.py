@@ -12,6 +12,7 @@ import inspect
 from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
+    EXPOSED_TOOLS,
     _signature_from_schema,
 )
 
@@ -106,6 +107,14 @@ class TestModuleSurface:
             f"these tools must NOT be exposed via the codex callback "
             f"because codex has built-in equivalents: {leaked}"
         )
+
+    def test_authenticated_group_research_graph_is_exposed(self):
+        """Codex group turns must retain Alfred's Topic-scoped graph adapter.
+
+        The adapter itself resolves the Project from the gateway-provided
+        HERMES_SESSION_KEY; no model-selected Project argument is exposed.
+        """
+        assert "group_research_graph" in EXPOSED_TOOLS
 
 
 

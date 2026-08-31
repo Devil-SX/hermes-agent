@@ -19,6 +19,7 @@ Scope (what we expose):
   - vision_analyze                       — image inspection by vision model
   - image_generate                       — image generation
   - skill_view, skills_list              — Hermes' skill library
+  - group_research_graph                 — authenticated Alfred Project shard
   - text_to_speech                       — TTS
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
@@ -126,6 +127,11 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "image_generate",
     "skill_view",
     "skills_list",
+    # Alfred's adapter derives the Project shard from HERMES_SESSION_KEY,
+    # which hermes_subprocess_env bridges from the gateway ContextVar into
+    # the Codex app-server process. The model cannot select a chat, Topic,
+    # Project id, or filesystem path through this tool.
+    "group_research_graph",
     "text_to_speech",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
