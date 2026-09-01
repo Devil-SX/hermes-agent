@@ -218,6 +218,54 @@ class TestRunTurn:
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
 
+    def test_failed_turn_preserves_structured_transient_http_error(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={
+                "id": "tu1",
+                "status": "failed",
+                "error": {
+                    "message": "upstream returned an HTML challenge",
+                    "codexErrorInfo": {
+                        "httpConnectionFailed": {"httpStatusCode": 403}
+                    },
+                },
+            },
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.error is not None
+        assert result.error_code == "httpConnectionFailed"
+        assert result.error_http_status == 403
+        assert result.error_retryable is True
+        # A transient upstream failure does not prove the local subprocess is
+        # wedged. The next *new* turn may recover on the same session.
+        assert result.should_retire is False
+
+    def test_unknown_structured_error_fails_closed_for_retryability(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={
+                "id": "tu1",
+                "status": "failed",
+                "error": {
+                    "message": "new protocol variant",
+                    "codexErrorInfo": {"futureFailure": {"httpStatusCode": 503}},
+                },
+            },
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.error_code == "futureFailure"
+        assert result.error_http_status == 503
+        assert result.error_retryable is False
+
 
 
     def test_foreign_completion_in_server_request_drain_is_ignored(self):

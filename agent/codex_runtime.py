@@ -966,6 +966,9 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
+        "error_code": turn.error_code,
+        "error_http_status": turn.error_http_status,
+        "error_retryable": turn.error_retryable,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

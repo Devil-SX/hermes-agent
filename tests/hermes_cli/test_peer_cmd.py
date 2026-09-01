@@ -186,3 +186,37 @@ def test_dm_reuses_existing_bot_chat(monkeypatch, capsys, fake_peer_server):
     assert payload["reply"] == "reply from the other machine"
     # No new session was created — the existing canonical chat was reused.
     assert _FakePeer.sessions == ["bc_existing"]
+
+
+def test_dm_rejects_transport_successful_failed_turn(monkeypatch, capsys):
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": "http://x"}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda _name: "secret-key-123456")
+    monkeypatch.setattr(peer_cmd, "_ensure_bot_chat", lambda _base, _key: "bc_1")
+    monkeypatch.setattr(
+        peer_cmd,
+        "_request",
+        lambda *_args, **_kwargs: {
+            "session_id": "bc_1",
+            "message": {"content": "HTTP 403 HTML"},
+            "completed": False,
+            "failed": True,
+            "error": "upstream challenge",
+            "error_code": "httpConnectionFailed",
+            "error_retryable": True,
+        },
+    )
+
+    rc = peer_cmd.cmd_peer(
+        SimpleNamespace(
+            peer_action="dm",
+            target="spark",
+            message="ping",
+            json=False,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "httpConnectionFailed" in captured.err
+    assert "upstream challenge" in captured.err
+    assert "HTTP 403 HTML" not in captured.out

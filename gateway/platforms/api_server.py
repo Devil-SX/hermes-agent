@@ -1192,6 +1192,65 @@ def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     return redacted
 
 
+def _agent_result_status(result: Any) -> Dict[str, Any]:
+    """Project one agent result into a transport-neutral terminal status.
+
+    Older runtimes omit ``completed`` on success, so absence remains
+    backward-compatible. Any explicit partial/failed/interrupted/error fact
+    makes an otherwise-unstated result non-completed. Error text is redacted
+    and bounded at the HTTP boundary; stable machine fields remain separate.
+    """
+    if not isinstance(result, dict):
+        return {
+            "completed": True,
+            "partial": False,
+            "interrupted": False,
+            "failed": False,
+            "error": None,
+            "error_code": None,
+            "error_http_status": None,
+            "error_retryable": False,
+        }
+
+    partial = bool(result.get("partial"))
+    interrupted = bool(result.get("interrupted"))
+    explicit_failed = bool(result.get("failed"))
+    raw_error = result.get("error")
+    error = _redact_api_error_text(raw_error, limit=2000) if raw_error else None
+    raw_completed = result.get("completed")
+    completed = (
+        bool(raw_completed)
+        if isinstance(raw_completed, bool)
+        else not (partial or interrupted or explicit_failed or error)
+    )
+    failed = explicit_failed or bool(error and not completed and not interrupted)
+
+    raw_http_status = result.get("error_http_status")
+    http_status = (
+        raw_http_status
+        if isinstance(raw_http_status, int)
+        and not isinstance(raw_http_status, bool)
+        and 100 <= raw_http_status <= 599
+        else None
+    )
+    raw_error_code = result.get("error_code")
+    error_code = (
+        str(raw_error_code).strip()[:120]
+        if isinstance(raw_error_code, str) and raw_error_code.strip()
+        else None
+    )
+    return {
+        "completed": completed,
+        "partial": partial,
+        "interrupted": interrupted,
+        "failed": failed,
+        "error": error,
+        "error_code": error_code,
+        "error_http_status": http_status,
+        "error_retryable": bool(result.get("error_retryable")),
+    }
+
+
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
     """OpenAI-style error envelope."""
     return {
@@ -4607,7 +4666,14 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        terminal_status = _agent_result_status(result)
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
+        headers["X-Hermes-Completed"] = (
+            "true" if terminal_status["completed"] else "false"
+        )
+        headers["X-Hermes-Partial"] = (
+            "true" if terminal_status["partial"] else "false"
+        )
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
         runtime = {}
@@ -4634,6 +4700,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "message": {"role": "assistant", "content": final_response},
                 "usage": usage,
                 "runtime": runtime,
+                **terminal_status,
             },
             headers=headers,
         )
@@ -4779,6 +4846,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                terminal_status = _agent_result_status(result)
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
@@ -4802,9 +4870,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "content": final_response,
-                    "completed": True,
-                    "partial": False,
-                    "interrupted": False,
+                    **terminal_status,
                     "runtime": effective_runtime,
                 }))
                 # A steer accepted after the final assistant response is drained
@@ -4815,7 +4881,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 completed_payload = {
                     "session_id": effective_session_id,
                     "message_id": message_id,
-                    "completed": True,
+                    **terminal_status,
                     "messages": turn_messages,
                     "usage": usage,
                     "runtime": effective_runtime,
@@ -4823,12 +4889,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 if pending_steer:
                     completed_payload["pending_steer"] = pending_steer
                 await queue.put(_event_payload("run.completed", completed_payload))
+                run_status = (
+                    "cancelled"
+                    if terminal_status["interrupted"]
+                    else "failed"
+                    if not terminal_status["completed"]
+                    else "completed"
+                )
                 self._set_run_status(
                     run_id,
-                    "completed",
+                    run_status,
                     session_id=effective_session_id,
+                    completed=terminal_status["completed"],
                     usage=usage,
                     last_event="run.completed",
+                    **{
+                        key: value
+                        for key, value in terminal_status.items()
+                        if key != "completed" and value is not None
+                    },
                     **({"pending_steer": pending_steer} if pending_steer else {}),
                 )
             except asyncio.CancelledError:

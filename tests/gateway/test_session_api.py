@@ -83,6 +83,72 @@ async def test_capabilities_advertises_session_control_surface(adapter):
 
 
 @pytest.mark.asyncio
+async def test_session_chat_projects_terminal_failure_without_breaking_http_contract(
+    adapter, session_db
+):
+    session_id = session_db.create_session("failed-turn", "api_server")
+
+    async def fake_run(**_kwargs):
+        return (
+            {
+                "final_response": "HTTP 403 — HTML error page",
+                "completed": False,
+                "partial": True,
+                "interrupted": False,
+                "error": "turn ended status=failed: upstream challenge",
+                "error_code": "httpConnectionFailed",
+                "error_http_status": 403,
+                "error_retryable": True,
+            },
+            {"total_tokens": 0},
+        )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "proof"},
+            )
+            payload = await resp.json()
+
+    # Keep the existing 200 response contract for peer clients, but make a
+    # failed model turn impossible to mistake for a completed assistant turn.
+    assert resp.status == 200
+    assert resp.headers["X-Hermes-Completed"] == "false"
+    assert resp.headers["X-Hermes-Partial"] == "true"
+    assert payload["message"]["content"] == "HTTP 403 — HTML error page"
+    assert payload["completed"] is False
+    assert payload["partial"] is True
+    assert payload["failed"] is True
+    assert payload["error_code"] == "httpConnectionFailed"
+    assert payload["error_http_status"] == 403
+    assert payload["error_retryable"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_chat_old_success_shape_defaults_to_completed(adapter, session_db):
+    session_id = session_db.create_session("old-success", "api_server")
+
+    async def fake_run(**_kwargs):
+        return {"final_response": "ok"}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "proof"},
+            )
+            payload = await resp.json()
+
+    assert payload["completed"] is True
+    assert payload["partial"] is False
+    assert payload["failed"] is False
+    assert payload["error"] is None
+
+
+@pytest.mark.asyncio
 async def test_session_messages_default_to_latest_bounded_page(adapter, session_db):
     session_id = session_db.create_session("bounded-messages", "api_server")
     session_db.replace_messages(
@@ -364,6 +430,64 @@ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter
     assert all(m.get("role") in ("assistant", "tool") for m in messages)
     # The tool call is preserved alongside the intermediate text.
     assert any(m.get("tool_calls") for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_keeps_failure_facts_in_terminal_events(
+    adapter, session_db
+):
+    import json as _json
+
+    session_id = session_db.create_session("failed-stream", "api_server")
+
+    async def fake_run(**_kwargs):
+        return (
+            {
+                "final_response": "partial text",
+                "completed": False,
+                "partial": True,
+                "error": "connection failed",
+                "error_code": "responseStreamDisconnected",
+                "error_http_status": 502,
+                "error_retryable": True,
+                "messages": [],
+            },
+            {"total_tokens": 3},
+        )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "proof"},
+            )
+            body = await resp.text()
+
+    payloads = {}
+    for block in body.split("\n\n"):
+        event_name = None
+        event_payload = None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event_name = line[len("event: "):]
+            elif line.startswith("data: "):
+                event_payload = _json.loads(line[len("data: "):])
+        if event_name and event_payload:
+            payloads[event_name] = event_payload
+
+    for event_name in ("assistant.completed", "run.completed"):
+        payload = payloads[event_name]
+        assert payload["completed"] is False
+        assert payload["partial"] is True
+        assert payload["failed"] is True
+        assert payload["error_code"] == "responseStreamDisconnected"
+        assert payload["error_http_status"] == 502
+        assert payload["error_retryable"] is True
+
+    run_status = next(iter(adapter._run_statuses.values()))
+    assert run_status["status"] == "failed"
+    assert run_status["completed"] is False
 
 
 # ---------------------------------------------------------------------------

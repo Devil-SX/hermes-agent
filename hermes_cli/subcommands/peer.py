@@ -252,6 +252,18 @@ def cmd_peer(args) -> int:
             print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
             return 1
 
+        # Session Chat keeps HTTP 200 for backward compatibility, but new
+        # peers carry the model turn's terminal facts. Never present a partial
+        # or failed turn as a delivered DM merely because it has text.
+        if result.get("completed") is False or result.get("failed") is True:
+            error = str(result.get("error") or "remote agent turn failed")[:400]
+            code = str(result.get("error_code") or "agent_error")[:120]
+            print(
+                f"Peer '{peer_name}' turn failed ({code}): {error}",
+                file=sys.stderr,
+            )
+            return 1
+
         reply = ""
         msg = result.get("message")
         if isinstance(msg, dict):

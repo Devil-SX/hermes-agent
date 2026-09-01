@@ -70,6 +70,13 @@ class TurnResult:
     tool_iterations: int = 0
     interrupted: bool = False
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
+    # Structured terminal failure facts from Codex app-server v2. Keep these
+    # separate from ``error``: callers may display the redacted text, while
+    # control planes need a stable category to decide whether a *new* turn may
+    # recover. ``error_retryable`` never authorizes replaying the failed turn.
+    error_code: Optional[str] = None
+    error_http_status: Optional[int] = None
+    error_retryable: bool = False
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
@@ -90,6 +97,44 @@ class TurnResult:
 # items when an interrupt or upstream error tears the turn down before the
 # normal completion path fires. Mirrors openclaw beta.8 fix.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
+
+_TRANSIENT_CODEX_ERROR_CODES = frozenset(
+    {
+        "serverOverloaded",
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+        "internalServerError",
+    }
+)
+
+
+def _codex_error_facts(error_obj: Any) -> tuple[Optional[str], Optional[int], bool]:
+    """Extract stable v2 ``codexErrorInfo`` facts without parsing prose.
+
+    Codex serializes simple variants as camel-case strings and connection
+    variants as ``{variant: {httpStatusCode}}``. Unknown/new shapes remain
+    non-retryable so a protocol addition fails closed until reviewed.
+    """
+    if isinstance(error_obj, dict):
+        info = error_obj.get("codexErrorInfo")
+    else:
+        info = getattr(error_obj, "codexErrorInfo", None)
+
+    code: Optional[str] = None
+    http_status: Optional[int] = None
+    if isinstance(info, str):
+        code = info.strip() or None
+    elif isinstance(info, dict) and len(info) == 1:
+        raw_code, details = next(iter(info.items()))
+        code = str(raw_code).strip() or None
+        if isinstance(details, dict):
+            raw_status = details.get("httpStatusCode")
+            if isinstance(raw_status, int) and not isinstance(raw_status, bool):
+                http_status = raw_status
+
+    return code, http_status, bool(code in _TRANSIENT_CODEX_ERROR_CODES)
 
 
 def _notification_scope_ids(
@@ -857,6 +902,11 @@ class CodexAppServerSession:
                         (note.get("params") or {}).get("turn") or {}
                     ).get("error")
                     if err_obj:
+                        (
+                            result.error_code,
+                            result.error_http_status,
+                            result.error_retryable,
+                        ) = _codex_error_facts(err_obj)
                         err_msg = _format_responses_error(err_obj, str(turn_status))
                         # If the turn failed for an auth/refresh reason,
                         # rewrite the error into a re-auth hint AND mark
@@ -1077,6 +1127,12 @@ class CodexAppServerSession:
                     result.error = result.error or "compact turn interrupted"
                 elif turn_status and turn_status != "completed":
                     err_obj = turn_obj.get("error")
+                    if err_obj:
+                        (
+                            result.error_code,
+                            result.error_http_status,
+                            result.error_retryable,
+                        ) = _codex_error_facts(err_obj)
                     err_msg = _format_responses_error(err_obj, str(turn_status))
                     stderr_blob = "\n".join(self._client.stderr_tail(40))
                     hint = _classify_oauth_failure(err_msg, stderr_blob)
