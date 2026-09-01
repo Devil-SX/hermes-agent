@@ -4533,11 +4533,11 @@ def redact_key(key: str) -> str:
     return mask_secret(key, empty=color("(not set)", Colors.DIM))
 
 
-# Key names (case-insensitive, exact match) whose VALUE is a credential and
-# must be masked before printing any config dict to the terminal. Covers the
-# fields a custom provider stuffs into the `model`/`custom_providers` blocks
-# (`api_key`) plus the usual token/secret/password shapes. Exact-match only so
-# benign keys like `token_count` or `secret_santa` don't get masked.
+# Canonical key names whose VALUE is a credential and must be masked before
+# printing config data to the terminal.  `_is_secret_config_key` also accepts
+# these names as a delimited suffix so provider/header shapes such as
+# `openai_api_key`, `X-API-Key`, and `githubToken` are covered without matching
+# benign names such as `token_count`, `secret_santa`, or `session_key`.
 _SECRET_CONFIG_KEYS = frozenset({
     "api_key",
     "apikey",
@@ -4558,32 +4558,84 @@ _SECRET_CONFIG_KEYS = frozenset({
 })
 
 
-def redact_config_value(value: Any, _depth: int = 0) -> Any:
+_SECRET_CONFIG_KEY_SUFFIXES = (
+    "_api_key",
+    "_apikey",
+    "_access_token",
+    "_refresh_token",
+    "_id_token",
+    "_token",
+    "_client_secret",
+    "_secret_access_key",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_private_key",
+    "_authorization",
+    "_bearer",
+    "_jwt",
+    "_auth",
+    "_credential",
+    "_credentials",
+)
+
+
+def _normalize_config_key_name(key: str) -> str:
+    """Normalize snake/kebab/dotted/camel key names for secret matching."""
+    # Split both ordinary camelCase (clientSecret) and acronym transitions
+    # (APIKey) before folding punctuation into a single underscore.
+    normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
+    return re.sub(r"[^a-z0-9]+", "_", normalized.casefold()).strip("_")
+
+
+def _is_secret_config_key(key: object) -> bool:
+    """Return whether a config key structurally denotes a credential value."""
+    if not isinstance(key, str):
+        return False
+    normalized = _normalize_config_key_name(key)
+    return (
+        normalized in _SECRET_CONFIG_KEYS
+        or normalized.endswith(_SECRET_CONFIG_KEY_SUFFIXES)
+    )
+
+
+def redact_config_value(
+    value: Any,
+    _depth: int = 0,
+    *,
+    key: Optional[str] = None,
+) -> Any:
     """Return a copy of ``value`` with credential-shaped keys masked for display.
 
-    Recursively walks dicts/lists and replaces the value of any key in
-    ``_SECRET_CONFIG_KEYS`` (case-insensitive) with a masked form via
-    :func:`agent.redact.mask_secret`. Non-secret keys and scalar values pass
-    through unchanged. Use this before ``print``-ing any config sub-tree that
-    might carry a custom-provider ``api_key`` — ``print`` bypasses the logging
-    redactor, and opaque tokens (e.g. Cloudflare ``cfut_...``) don't match the
-    vendor-prefix regexes either, so structural key-name masking is required.
+    ``key`` supplies the path leaf when a scalar was fetched directly (for
+    example ``config get model.api_key``). Dict/list values are walked
+    recursively, and credential-bearing URL query/userinfo components are
+    redacted even under neutral keys such as ``url``. Non-secret scalar values
+    pass through unchanged so ordinary ``config get`` output stays scriptable.
     """
-    from agent.redact import mask_secret
+    from agent.redact import mask_secret, redact_url_credentials
 
     # Defensive bound on recursion depth for pathological/cyclic configs.
     if _depth > 20:
-        return value
+        # Fail closed: returning the original subtree here could leak a secret
+        # placed below the bound.
+        return "***"
+    if _is_secret_config_key(key) and isinstance(value, str) and value:
+        return mask_secret(value)
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            if isinstance(k, str) and k.lower() in _SECRET_CONFIG_KEYS and isinstance(v, str) and v:
-                out[k] = mask_secret(v)
-            else:
-                out[k] = redact_config_value(v, _depth + 1)
+            out[k] = redact_config_value(
+                v,
+                _depth + 1,
+                key=k if isinstance(k, str) else None,
+            )
         return out
     if isinstance(value, list):
-        return [redact_config_value(v, _depth + 1) for v in value]
+        return [redact_config_value(v, _depth + 1, key=key) for v in value]
+    if isinstance(value, str):
+        return redact_url_credentials(value)
     return value
 
 
@@ -5631,16 +5683,10 @@ def set_config_value(key: str, value: str, force: bool = False):
         except Exception:
             pass  # best-effort: the config write above already succeeded
 
-    # Mask the echoed value when the (possibly nested) key is credential-shaped
-    # — e.g. `hermes config set model.api_key cfut_...` routes to config.yaml
-    # (lowercase, so it misses the .env api_keys list above) and would otherwise
-    # print the raw secret to the terminal.
-    _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
-        from agent.redact import mask_secret
-        _display_value = mask_secret(value)
-    else:
-        _display_value = value
+    # Use the same structural/URL redaction boundary as config show/get so
+    # suffix-shaped credential fields cannot leak through the write echo.
+    _leaf_key = key.rsplit(".", 1)[-1]
+    _display_value = redact_config_value(value, key=_leaf_key)
     print(f"✓ Set {key} = {_display_value} in {config_path}")
     warn_unpinned_cron_jobs_after_model_config_change(key, value, user_config)
 
@@ -5674,7 +5720,9 @@ def get_config_value(key: str, *, as_json: bool = False):
         print(f"Config key not set: {key}", file=sys.stderr)
         sys.exit(1)
 
-    print(_format_config_get_value(value, as_json=as_json))
+    leaf_key = key.rsplit(".", 1)[-1]
+    display_value = redact_config_value(value, key=leaf_key)
+    print(_format_config_get_value(display_value, as_json=as_json))
 
 
 def unset_config_value(key: str):

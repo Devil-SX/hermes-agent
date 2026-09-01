@@ -694,6 +694,19 @@ def _redact_strict_url_credentials(text: str) -> str:
     return _STRICT_URL_USERINFO_RE.sub(_redact_userinfo, text)
 
 
+def redact_url_credentials(text: str) -> str:
+    """Redact credential-bearing URL components at an explicit egress boundary.
+
+    Unlike :func:`redact_sensitive_text`, this narrow helper does not apply
+    unrelated display redactions (for example phone-number masking).  It is
+    intended for structured output such as ``hermes config get`` where every
+    string may contain a URL, but non-URL scalar values must remain scriptable.
+    """
+    if text is None:
+        return None
+    return _redact_strict_url_credentials(text)
+
+
 def redact_cdp_url(value: object) -> str:
     """Mask secrets in a CDP/browser endpoint URL before it is logged.
 

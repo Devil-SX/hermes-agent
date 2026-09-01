@@ -10,6 +10,7 @@ import pytest
 from hermes_cli.config import (
     config_command,
     cron_model_drift_guard_enabled,
+    get_config_value,
     set_config_value,
 )
 
@@ -169,6 +170,64 @@ class TestConfigGetUnset:
         config_command(args)
 
         assert capsys.readouterr().out.strip() == "120"
+
+    @pytest.mark.parametrize("as_json", [False, True])
+    def test_config_get_masks_direct_secret_leaf(
+        self, _isolated_hermes_home, capsys, as_json
+    ):
+        secret = "cfut_DIRECT_SECRET_1234567890abcdef"
+        (_isolated_hermes_home / "config.yaml").write_text(
+            f"model:\n  api_key: {secret}\n",
+            encoding="utf-8",
+        )
+
+        get_config_value("model.api_key", as_json=as_json)
+
+        output = capsys.readouterr().out.strip()
+        assert secret not in output
+        assert "DIRECT_SECRET" not in output
+        assert output
+
+    def test_config_get_masks_model_mapping(self, _isolated_hermes_home, capsys):
+        secret = "cfut_MODEL_SECRET_1234567890abcdef"
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: custom/example\n"
+            f"  api_key: {secret}\n",
+            encoding="utf-8",
+        )
+
+        get_config_value("model")
+
+        output = capsys.readouterr().out
+        assert secret not in output
+        assert "MODEL_SECRET" not in output
+        assert "default: custom/example" in output
+
+    @pytest.mark.parametrize("as_json", [False, True])
+    def test_config_get_masks_secret_subtree_and_url_credentials(
+        self, _isolated_hermes_home, capsys, as_json
+    ):
+        header_secret = "opaque-header-secret-1234567890"
+        query_secret = "opaque-query-secret"
+        userinfo_secret = "opaque-userinfo-secret"
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "mcp_servers:\n"
+            "  demo:\n"
+            "    headers:\n"
+            f"      X-API-Key: {header_secret}\n"
+            "    url: "
+            f"https://alice:{userinfo_secret}@example.test/mcp?api-key={query_secret}&view=public\n",
+            encoding="utf-8",
+        )
+
+        get_config_value("mcp_servers", as_json=as_json)
+
+        output = capsys.readouterr().out
+        assert header_secret not in output
+        assert query_secret not in output
+        assert userinfo_secret not in output
+        assert "view=public" in output
 
 
     def test_config_unset_removes_yaml_key_and_synced_env(self, _isolated_hermes_home, capsys):
@@ -454,12 +513,37 @@ class TestSecretRedactionInDisplay:
 
     def test_redact_config_value_ignores_benign_keys(self):
         from hermes_cli.config import redact_config_value
-        cfg = {"token_count": 1234, "secret_santa": "alice", "max_turns": 90}
+        cfg = {
+            "token_count": 1234,
+            "secret_santa": "alice",
+            "session_key": "routing-field",
+            "public_key": "public-material",
+            "max_turns": 90,
+        }
 
         out = redact_config_value(cfg)
 
         # Exact-match only — substrings like token_count must NOT be masked.
         assert out == cfg
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "X-API-Key",
+            "x_api_key",
+            "xApiKey",
+            "providerToken",
+            "AWS_SECRET_ACCESS_KEY",
+            "database-password",
+        ],
+    )
+    def test_redact_config_value_masks_delimited_secret_suffixes(self, key):
+        from hermes_cli.config import redact_config_value
+        secret = "opaque-provider-secret-1234567890"
+
+        out = redact_config_value({key: secret})
+
+        assert secret not in str(out)
 
     def test_set_echo_masks_secret_value(self, _isolated_hermes_home, capsys):
         secret = "cfut_ANOTHERSECRET0987654321zyxwvu"
@@ -474,6 +558,17 @@ class TestSecretRedactionInDisplay:
 
         captured = capsys.readouterr()
         assert "Set model.reasoning_effort = high" in captured.out
+
+    def test_set_echo_masks_hyphenated_secret_suffix(
+        self, _isolated_hermes_home, capsys
+    ):
+        secret = "opaque-provider-secret-1234567890"
+
+        set_config_value("custom.headers.X-API-Key", secret, force=True)
+
+        captured = capsys.readouterr()
+        assert secret not in captured.out
+        assert "Set custom.headers.X-API-Key" in captured.out
 
 # #34067: Schema validation for unknown keys
 # ---------------------------------------------------------------------------
