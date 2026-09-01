@@ -10210,16 +10210,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _evt_cmd_busy = event.get_command()
         if _evt_cmd_busy:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler as _gpc_busy
-                _plugin_handler_busy = _gpc_busy(_evt_cmd_busy.replace("_", "-"))
+                from hermes_cli.plugins import invoke_plugin_command
+
+                _plugin_handled_busy, _plugin_result = await invoke_plugin_command(
+                    _evt_cmd_busy.replace("_", "-"),
+                    event.get_command_args().strip(),
+                    session_key=session_key,
+                )
             except Exception as _plugin_err:
-                logger.warning("Busy-path plugin command lookup failed: %s", _plugin_err)
-                _plugin_handler_busy = None
-            if _plugin_handler_busy is not None:
-                _plugin_args_busy = event.get_command_args().strip()
-                _plugin_result = _plugin_handler_busy(_plugin_args_busy)
-                if asyncio.iscoroutine(_plugin_result):
-                    _plugin_result = await _plugin_result
+                logger.warning("Busy-path plugin command dispatch failed: %s", _plugin_err)
+                _plugin_handled_busy = False
+                _plugin_result = None
+            if _plugin_handled_busy:
                 _adapter_busy = self._adapter_for_source(event.source)
                 if _adapter_busy and _plugin_result:
                     _text_busy, _eph_busy = _adapter_busy._unwrap_ephemeral(str(_plugin_result))
@@ -18037,16 +18039,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugin-registered slash commands
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import invoke_plugin_command
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
-                    user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                plugin_handled, result = await invoke_plugin_command(
+                    command.replace("_", "-"),
+                    event.get_command_args().strip(),
+                    session_key=_quick_key,
+                )
+                if plugin_handled:
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)

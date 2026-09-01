@@ -225,3 +225,68 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     # First emit_collect fires on the original command; after rewrite the
     # dispatcher does NOT re-fire for the new command (one decision per turn).
     assert call_log == ["command:status"]
+
+
+@pytest.mark.asyncio
+async def test_cold_plugin_command_receives_topic_session_context(monkeypatch):
+    """Program-only commands must see the Telegram Topic they were sent in."""
+    import gateway.run as gateway_run
+    from hermes_cli import plugins as plugins_mod
+    from tools.approval import get_current_session_key
+
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("plugin command leaked to the agent")
+    )
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_commands",
+        lambda: {"alfred-model": {"description": "Alfred model", "args_hint": ""}},
+    )
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: (
+            lambda _args: get_current_session_key(default="")
+        )
+        if name == "alfred-model"
+        else None,
+    )
+
+    result = await runner._handle_message(_make_event("/alfred_model"))
+
+    assert result == build_session_key(_make_source())
+    runner._run_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_busy_plugin_command_receives_topic_session_context(monkeypatch):
+    """The inline busy dispatch must use the same session binding as cold dispatch."""
+    from hermes_cli import plugins as plugins_mod
+    from tools.approval import get_current_session_key
+
+    runner = _make_runner()
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter._send_with_retry = AsyncMock()
+    adapter._unwrap_ephemeral.side_effect = lambda value: (value, 0)
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: (
+            lambda _args: get_current_session_key(default="")
+        )
+        if name == "alfred-model"
+        else None,
+    )
+    session_key = build_session_key(_make_source())
+
+    handled = await runner._handle_active_session_busy_message(
+        _make_event("/alfred_model"), session_key
+    )
+
+    assert handled is True
+    adapter._send_with_retry.assert_awaited_once()
+    assert adapter._send_with_retry.await_args.kwargs["content"] == session_key
