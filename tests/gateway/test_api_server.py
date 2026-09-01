@@ -725,6 +725,42 @@ class TestHealthDetailedEndpoint:
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
 
+    @pytest.mark.asyncio
+    async def test_health_detailed_prefers_live_gateway_work_count(self, adapter):
+        """A synchronous API turn must not be hidden by a stale idle snapshot."""
+        adapter.gateway_runner = types.SimpleNamespace(active_work_count=lambda: 3)
+        app = _create_app(adapter)
+        with patch(
+            "gateway.status.read_runtime_status",
+            return_value={"gateway_state": "running", "active_agents": 0},
+        ), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["active_agents"] == 3
+        assert data["gateway_busy"] is True
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_falls_back_when_live_counter_fails(self, adapter):
+        def fail_count():
+            raise RuntimeError("counter unavailable")
+
+        adapter.gateway_runner = types.SimpleNamespace(active_work_count=fail_count)
+        app = _create_app(adapter)
+        with patch(
+            "gateway.status.read_runtime_status",
+            return_value={"gateway_state": "running", "active_agents": 2},
+        ), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["active_agents"] == 2
+        assert data["gateway_busy"] is True
+
 
     @pytest.mark.asyncio
     async def test_public_health_does_not_run_readiness_probes(self, adapter):

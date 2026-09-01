@@ -100,12 +100,12 @@ _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 _TRANSIENT_CODEX_ERROR_CODES = frozenset(
     {
-        "serverOverloaded",
-        "httpConnectionFailed",
-        "responseStreamConnectionFailed",
-        "responseStreamDisconnected",
-        "responseTooManyFailedAttempts",
-        "internalServerError",
+        "serveroverloaded",
+        "httpconnectionfailed",
+        "responsestreamconnectionfailed",
+        "responsestreamdisconnected",
+        "responsetoomanyfailedattempts",
+        "internalservererror",
     }
 )
 
@@ -126,15 +126,28 @@ def _codex_error_facts(error_obj: Any) -> tuple[Optional[str], Optional[int], bo
     http_status: Optional[int] = None
     if isinstance(info, str):
         code = info.strip() or None
-    elif isinstance(info, dict) and len(info) == 1:
-        raw_code, details = next(iter(info.items()))
-        code = str(raw_code).strip() or None
+    elif isinstance(info, dict):
+        # Current v2 schemas encode data-bearing variants as
+        # {"HttpConnectionFailed": {"httpStatusCode": 403}}. Accept the
+        # older lower-camel spelling too, plus the forward-compatible tagged
+        # shape used by some generated clients.
+        raw_code = info.get("type")
+        details: Any = info
+        if raw_code is None and len(info) == 1:
+            raw_code, details = next(iter(info.items()))
+        code = str(raw_code).strip() if raw_code is not None else None
+        code = code or None
         if isinstance(details, dict):
             raw_status = details.get("httpStatusCode")
             if isinstance(raw_status, int) and not isinstance(raw_status, bool):
                 http_status = raw_status
 
-    return code, http_status, bool(code in _TRANSIENT_CODEX_ERROR_CODES)
+    normalized_code = (
+        "".join(character for character in code if character.isalnum()).casefold()
+        if code
+        else ""
+    )
+    return code, http_status, bool(normalized_code in _TRANSIENT_CODEX_ERROR_CODES)
 
 
 def _notification_scope_ids(
@@ -699,6 +712,11 @@ class CodexAppServerSession:
             else time.monotonic() + max(float(turn_timeout), 0.0)
         )
         turn_complete = False
+        # Codex v2 emits a standalone `error` notification before the final
+        # `turn/completed(status=failed)`. The completion's embedded error may
+        # be absent or message-only, so retain the authoritative earlier
+        # object for structured classification.
+        observed_error_obj: Any = None
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
         # within post_tool_quiet_timeout and the turn hasn't completed, we
@@ -806,6 +824,17 @@ class CodexAppServerSession:
                             logger.debug(
                                 "on_event callback raised", exc_info=True
                             )
+                    if pending.get("method") == "error":
+                        candidate = (pending.get("params") or {}).get("error")
+                        if candidate:
+                            observed_error_obj = candidate
+                            code, http_status, retryable = _codex_error_facts(
+                                candidate
+                            )
+                            if code:
+                                result.error_code = code
+                                result.error_http_status = http_status
+                                result.error_retryable = retryable
                     _apply_token_usage_notification(result, pending)
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
@@ -853,6 +882,16 @@ class CodexAppServerSession:
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
 
+            if method == "error":
+                candidate = (note.get("params") or {}).get("error")
+                if candidate:
+                    observed_error_obj = candidate
+                    code, http_status, retryable = _codex_error_facts(candidate)
+                    if code:
+                        result.error_code = code
+                        result.error_http_status = http_status
+                        result.error_retryable = retryable
+
             _apply_token_usage_notification(result, note)
             _apply_compaction_notification(result, note)
 
@@ -898,15 +937,16 @@ class CodexAppServerSession:
                     (note.get("params") or {}).get("turn") or {}
                 ).get("status")
                 if turn_status and turn_status not in {"completed", "interrupted"}:
-                    err_obj = (
+                    completion_error_obj = (
                         (note.get("params") or {}).get("turn") or {}
                     ).get("error")
+                    err_obj = completion_error_obj or observed_error_obj
                     if err_obj:
-                        (
-                            result.error_code,
-                            result.error_http_status,
-                            result.error_retryable,
-                        ) = _codex_error_facts(err_obj)
+                        code, http_status, retryable = _codex_error_facts(err_obj)
+                        if code:
+                            result.error_code = code
+                            result.error_http_status = http_status
+                            result.error_retryable = retryable
                         err_msg = _format_responses_error(err_obj, str(turn_status))
                         # If the turn failed for an auth/refresh reason,
                         # rewrite the error into a re-auth hint AND mark
@@ -922,6 +962,11 @@ class CodexAppServerSession:
                             result.error = self._format_error_with_stderr(
                                 f"turn ended status={turn_status}", err_msg
                             )
+                    else:
+                        result.error = self._format_error_with_stderr(
+                            f"turn ended status={turn_status}",
+                            "Codex app-server supplied no error details",
+                        )
 
         deadline_expired = (
             not result.interrupted
@@ -1016,6 +1061,7 @@ class CodexAppServerSession:
 
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
+        observed_error_obj: Any = None
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
@@ -1096,6 +1142,16 @@ class CodexAppServerSession:
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
 
+            if method == "error":
+                candidate = (note.get("params") or {}).get("error")
+                if candidate:
+                    observed_error_obj = candidate
+                    code, http_status, retryable = _codex_error_facts(candidate)
+                    if code:
+                        result.error_code = code
+                        result.error_http_status = http_status
+                        result.error_retryable = retryable
+
             _apply_token_usage_notification(result, note)
             _apply_compaction_notification(result, note)
             self._track_pending_file_change(note)
@@ -1126,13 +1182,13 @@ class CodexAppServerSession:
                     result.interrupted = True
                     result.error = result.error or "compact turn interrupted"
                 elif turn_status and turn_status != "completed":
-                    err_obj = turn_obj.get("error")
+                    err_obj = turn_obj.get("error") or observed_error_obj
                     if err_obj:
-                        (
-                            result.error_code,
-                            result.error_http_status,
-                            result.error_retryable,
-                        ) = _codex_error_facts(err_obj)
+                        code, http_status, retryable = _codex_error_facts(err_obj)
+                        if code:
+                            result.error_code = code
+                            result.error_http_status = http_status
+                            result.error_retryable = retryable
                     err_msg = _format_responses_error(err_obj, str(turn_status))
                     stderr_blob = "\n".join(self._client.stderr_tail(40))
                     hint = _classify_oauth_failure(err_msg, stderr_blob)

@@ -8577,6 +8577,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             + self._active_api_run_count()
         )
 
+    def active_work_count(self) -> int:
+        """Return the live total exposed to lifecycle and health consumers.
+
+        Runtime status is a durable snapshot and can briefly lag adapter-owned
+        API work.  This public read-only view lets an in-process health handler
+        use the exact same accounting as shutdown drain without duplicating or
+        reaching into GatewayRunner's internal collections.
+        """
+        return self._active_work_count()
+
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
         own in-flight tracking (``cron.scheduler._running_job_ids``).

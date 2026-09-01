@@ -966,9 +966,13 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
-        "error_code": turn.error_code,
-        "error_http_status": turn.error_http_status,
-        "error_retryable": turn.error_retryable,
+        # Transport result doubles and older compatible transports predate
+        # the structured error fields.  Keep the projection additive: callers
+        # receive the richer contract when available without requiring every
+        # TurnResult-shaped implementation to upgrade in lockstep.
+        "error_code": getattr(turn, "error_code", None),
+        "error_http_status": getattr(turn, "error_http_status", None),
+        "error_retryable": bool(getattr(turn, "error_retryable", False)),
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

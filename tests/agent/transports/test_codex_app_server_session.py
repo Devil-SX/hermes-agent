@@ -245,6 +245,72 @@ class TestRunTurn:
         # wedged. The next *new* turn may recover on the same session.
         assert result.should_retire is False
 
+    def test_standalone_error_event_supplies_terminal_http_facts(self):
+        """Codex v2 emits `error` before a message-only failed completion."""
+        client = FakeClient()
+        client.queue_notification(
+            "error",
+            threadId="t",
+            turnId="tu1",
+            error={
+                "message": "upstream returned an HTML challenge",
+                "codexErrorInfo": {
+                    "HttpConnectionFailed": {"httpStatusCode": 403}
+                },
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={
+                "id": "tu1",
+                "status": "failed",
+                "error": {"message": "HTTP 403 — HTML error page"},
+            },
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.error is not None
+        assert result.error_code == "HttpConnectionFailed"
+        assert result.error_http_status == 403
+        assert result.error_retryable is True
+        assert result.should_retire is False
+
+    def test_lower_camel_transient_variant_remains_compatible(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={
+                "id": "tu1",
+                "status": "failed",
+                "error": {
+                    "message": "service overloaded",
+                    "codexErrorInfo": "serverOverloaded",
+                },
+            },
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.error_code == "serverOverloaded"
+        assert result.error_retryable is True
+
+    def test_failed_turn_without_error_details_still_fails_closed(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "failed", "error": None},
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.error is not None
+        assert "supplied no error details" in result.error
+        assert result.error_retryable is False
+
     def test_unknown_structured_error_fails_closed_for_retryability(self):
         client = FakeClient()
         client.queue_notification(

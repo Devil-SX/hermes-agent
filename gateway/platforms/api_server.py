@@ -3211,6 +3211,18 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime = read_runtime_status() or {}
         gw_state = runtime.get("gateway_state")
         gw_active = parse_active_agents(runtime.get("active_agents", 0))
+        # Prefer the live in-process total over the persisted snapshot.  API
+        # session turns are adapter-owned and can begin between status-file
+        # writes; lifecycle probes must still see them before deciding a
+        # gateway is idle enough to restart.  Keep the snapshot fallback for
+        # standalone adapters and older GatewayRunner implementations.
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        live_active_work_count = getattr(runner, "active_work_count", None)
+        if callable(live_active_work_count):
+            try:
+                gw_active = parse_active_agents(live_active_work_count())
+            except Exception:
+                logger.debug("Live gateway work count failed", exc_info=True)
         # This endpoint is served BY the gateway process, so it is by definition
         # alive — gateway_running is True. Derive busy/drainable from the same
         # shared contract /api/status uses so the two surfaces never disagree.
