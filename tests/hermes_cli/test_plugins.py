@@ -22,6 +22,7 @@ from hermes_cli.plugins import (
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
+    invoke_plugin_command,
     resolve_plugin_command_result,
     _portable_skill_namespace,
 )
@@ -1947,6 +1948,63 @@ class TestPluginCommands:
 
 
 class TestPluginCommandResultResolution:
+
+    @pytest.mark.asyncio
+    async def test_gateway_session_is_bound_and_restored(self, monkeypatch):
+        from tools.approval import (
+            get_current_session_key,
+            reset_current_session_key,
+            set_current_session_key,
+        )
+
+        outer_token = set_current_session_key("outer-session")
+        try:
+            monkeypatch.setattr(
+                "hermes_cli.plugins.get_plugin_command_handler",
+                lambda name: (
+                    lambda args: f"{get_current_session_key(default='')}|{args}"
+                )
+                if name == "session-aware"
+                else None,
+            )
+
+            handled, result = await invoke_plugin_command(
+                "session-aware",
+                "show",
+                session_key="agent:main:telegram:dm:owner:topic-7",
+            )
+
+            assert handled is True
+            assert result == "agent:main:telegram:dm:owner:topic-7|show"
+            assert get_current_session_key(default="") == "outer-session"
+        finally:
+            reset_current_session_key(outer_token)
+
+    @pytest.mark.asyncio
+    async def test_gateway_session_is_restored_when_handler_raises(self, monkeypatch):
+        from tools.approval import (
+            get_current_session_key,
+            reset_current_session_key,
+            set_current_session_key,
+        )
+
+        def _raise(_args):
+            assert get_current_session_key(default="") == "topic-session"
+            raise RuntimeError("plugin failed")
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_command_handler",
+            lambda _name: _raise,
+        )
+        outer_token = set_current_session_key("outer-session")
+        try:
+            with pytest.raises(RuntimeError, match="plugin failed"):
+                await invoke_plugin_command(
+                    "session-aware", "", session_key="topic-session"
+                )
+            assert get_current_session_key(default="") == "outer-session"
+        finally:
+            reset_current_session_key(outer_token)
 
 
     def test_awaits_async_result_with_running_loop(self, monkeypatch):

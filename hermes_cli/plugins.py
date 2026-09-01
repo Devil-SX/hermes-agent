@@ -6460,6 +6460,41 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     return entry["handler"] if entry else None
 
 
+async def invoke_plugin_command(
+    name: str,
+    raw_args: str,
+    *,
+    session_key: str = "",
+) -> Tuple[bool, Any]:
+    """Invoke a plugin slash command with its gateway session context.
+
+    The gateway executes program-only plugin commands before an agent turn is
+    created.  Bind the routing session explicitly so handlers see the same
+    session identity they would see inside a normal agent turn.  The token is
+    always restored, including when a handler raises, so concurrent gateway
+    tasks cannot leak session identity into one another.
+
+    Returns ``(handled, result)`` so a handler that intentionally returns
+    ``None`` remains distinguishable from an unknown command.
+    """
+    handler = get_plugin_command_handler(name)
+    if handler is None:
+        return False, None
+
+    # Lazy import avoids making the plugin discovery module depend on the
+    # approval subsystem during interpreter startup.
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    token = set_current_session_key(session_key)
+    try:
+        result = handler(raw_args)
+        if inspect.isawaitable(result):
+            result = await result
+        return True, result
+    finally:
+        reset_current_session_key(token)
+
+
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
 
 
