@@ -207,8 +207,11 @@ model:
 ```
 
 When the policy is present, the command reports that the runtime is
-operator-pinned and leaves the config unchanged. The policy is optional and
-does not alter the default behavior of unmanaged Hermes installations.
+operator-pinned and leaves the config unchanged. Direct `openai-codex`
+auxiliary clients are also excluded, so `auto` auxiliary routing continues to
+another configured provider rather than bypassing app-server. The policy is
+optional and does not alter the default behavior of unmanaged Hermes
+installations.
 
 ## Self-improvement loop (memory + skill nudges)
 

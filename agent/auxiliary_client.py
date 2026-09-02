@@ -617,6 +617,23 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
     return _PROVIDER_ALIASES.get(normalized, normalized)
 
 
+def _direct_codex_forbidden_by_runtime_policy() -> bool:
+    """Return whether this deployment forbids direct Codex HTTP clients."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        return False
+    model = config.get("model") if isinstance(config, dict) else None
+    if not isinstance(model, dict):
+        return False
+    return (
+        str(model.get("openai_runtime_policy") or "").strip().lower()
+        == "codex_app_server"
+    )
+
+
 # Sentinel: when returned by _fixed_temperature_for_model(), callers must
 # strip the ``temperature`` key from API kwargs entirely so the provider's
 # server-side default applies.  Kimi/Moonshot models manage temperature
@@ -6274,6 +6291,12 @@ def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+    if provider == "openai-codex" and _direct_codex_forbidden_by_runtime_policy():
+        logger.warning(
+            "Direct openai-codex auxiliary/runtime client blocked by "
+            "model.openai_runtime_policy=codex_app_server"
+        )
+        return None, None
 
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
