@@ -11,6 +11,8 @@ Pure-function / config-driven; no live model calls.
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from agent import background_review as br
 
 
@@ -109,6 +111,39 @@ def test_routing_resolution_failure_falls_back_to_parent():
         rt = br._resolve_review_runtime(agent)
     assert rt["routed"] is False
     assert rt["provider"] == "openai-codex"
+
+
+def test_app_server_parent_does_not_downgrade_when_fallback_disabled():
+    agent = _FakeAgent()
+    task = {
+        "provider": "auto",
+        "model": "",
+        "fallback_to_parent": False,
+    }
+
+    with pytest.raises(
+        br.BackgroundReviewRouteUnavailable,
+        match="direct codex_responses fallback is disabled",
+    ):
+        br._resolve_review_runtime(agent, task)
+
+
+def test_aux_resolution_failure_does_not_fallback_when_disabled():
+    agent = _FakeAgent()
+    task = {
+        "provider": "openrouter",
+        "model": "google/gemini-3-flash-preview",
+        "fallback_to_parent": False,
+    }
+
+    with patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        side_effect=RuntimeError("boom"),
+    ), pytest.raises(
+        br.BackgroundReviewRouteUnavailable,
+        match="parent fallback is disabled",
+    ):
+        br._resolve_review_runtime(agent, task)
 
 
 # ---------------------------------------------------------------------------

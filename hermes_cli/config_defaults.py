@@ -1236,6 +1236,10 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "provider": "auto",
             "model": "",
+            # Compatibility default: a missing/failed auxiliary route may use
+            # the parent. Set false when direct fallback would violate an
+            # operator's egress or runtime policy.
+            "fallback_to_parent": True,
             "base_url": "",
             "api_key": "",
             "timeout": 120,

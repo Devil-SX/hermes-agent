@@ -201,6 +201,10 @@ def cancel_background_review_for_live_turn(agent: Any) -> None:
 _REVIEW_MAX_ITERATIONS = 16
 
 
+class BackgroundReviewRouteUnavailable(RuntimeError):
+    """Raised when a fail-closed review cannot obtain its configured route."""
+
+
 def _background_review_task_config(
     task_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -288,10 +292,29 @@ def _resolve_review_runtime(
     the fork uses the main model and the warm cache, exactly as before. When
     ``auxiliary.background_review.{provider,model}`` names a concrete model
     different from the parent's, resolve that runtime and set ``routed=True``.
+
+    Operators that require strict egress routing can set
+    ``fallback_to_parent: false``. In that mode an app-server parent is never
+    silently converted into a direct Responses API request, and failure to
+    resolve the configured auxiliary route raises
+    :class:`BackgroundReviewRouteUnavailable` instead of using the parent.
     """
+    task = _background_review_task_config(task_cfg)
+    try:
+        from utils import is_truthy_value
+
+        fallback_to_parent = is_truthy_value(
+            task.get("fallback_to_parent"), default=True
+        )
+    except Exception as exc:
+        raise BackgroundReviewRouteUnavailable(
+            "invalid auxiliary.background_review.fallback_to_parent value"
+        ) from exc
+
     parent_runtime = agent._current_main_runtime()
     parent_api_mode = parent_runtime.get("api_mode") or None
-    if parent_api_mode == "codex_app_server":
+    parent_uses_app_server = parent_api_mode == "codex_app_server"
+    if parent_uses_app_server:
         parent_api_mode = "codex_responses"
     parent = {
         "provider": agent.provider,
@@ -306,14 +329,23 @@ def _resolve_review_runtime(
         "args": list(getattr(agent, "acp_args", []) or []),
         "routed": False,
     }
-    task = _background_review_task_config(task_cfg)
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
     task_api_key = (str(task.get("api_key", "")).strip() or None)
     if not (task_provider and task_provider != "auto" and task_model):
+        if parent_uses_app_server and not fallback_to_parent:
+            raise BackgroundReviewRouteUnavailable(
+                "parent uses codex_app_server and no independent review route "
+                "is configured; direct codex_responses fallback is disabled"
+            )
         return parent
     if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
+        if parent_uses_app_server and not fallback_to_parent:
+            raise BackgroundReviewRouteUnavailable(
+                "review route matches the codex_app_server parent; direct "
+                "codex_responses fallback is disabled"
+            )
         return parent  # same model/provider as parent -> not routed
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -337,6 +369,11 @@ def _resolve_review_runtime(
             "routed": True,
         }
     except Exception as e:
+        if not fallback_to_parent:
+            raise BackgroundReviewRouteUnavailable(
+                f"configured auxiliary route {task_provider}/{task_model} "
+                "could not be resolved and parent fallback is disabled"
+            ) from e
         logger.debug("background-review aux routing failed (%s); using main model", e)
         return parent
 
@@ -1106,8 +1143,9 @@ def _run_review_in_thread(
             # _resolve_review_runtime() returns the parent's live runtime by
             # default (routed=False; main model, warm cache), or — when the user
             # set auxiliary.background_review.{provider,model} to a different
-            # model — that model's runtime (routed=True). The codex_app_server
-            # -> codex_responses downgrade is applied inside the resolver.
+            # model — that model's runtime (routed=True). The legacy
+            # codex_app_server -> codex_responses downgrade is applied inside
+            # the resolver only when parent fallback remains enabled.
             _rt = _resolve_review_runtime(agent, task_cfg)
             _routed = bool(_rt.get("routed"))
             # skip_memory=True keeps the review fork from
@@ -1439,6 +1477,9 @@ def _run_review_in_thread(
                 except Exception:
                     pass
 
+    except BackgroundReviewRouteUnavailable as e:
+        logger.warning("Background review skipped: %s", e)
+        _log_review_completion({}, "skipped-route-unavailable")
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
         if review_usage:

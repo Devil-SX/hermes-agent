@@ -332,6 +332,28 @@ identical and skill capture near-identical to the main-model review.
 Leave it at `auto` (or set it to your main model) and nothing changes — the
 review keeps running on the main model with the full warm-cache replay.
 
+### Requiring an independent review route (`fallback_to_parent`)
+
+By default, Hermes preserves its compatibility behavior when an auxiliary
+route cannot be resolved: it falls back to the parent model. For a main Codex
+app-server session, that fallback uses the direct Responses runtime because
+the background agent loop cannot run through app-server.
+
+Operators with a strict egress policy can make the review fail closed:
+
+```yaml
+auxiliary:
+  background_review:
+    provider: openrouter
+    model: google/gemini-3-flash-preview
+    fallback_to_parent: false
+```
+
+With `fallback_to_parent: false`, Hermes skips the review and records
+`result=skipped-route-unavailable` if the configured route cannot be resolved.
+It never silently converts a Codex app-server parent into a direct Responses
+request. This option defaults to `true` for backward compatibility.
+
 ### Disabling automatic reviews (`enabled`)
 
 The review fork can burn a meaningful share of total tokens on busy hosts.
