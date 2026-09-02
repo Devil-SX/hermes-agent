@@ -73,6 +73,23 @@ def get_current_runtime(config: dict) -> str:
     return "auto"
 
 
+def get_required_runtime(config: dict) -> Optional[str]:
+    """Return an operator-pinned runtime, if one is configured.
+
+    ``model.openai_runtime_policy`` is intentionally separate from the live
+    selection: deployment tooling can require a runtime while the ordinary
+    slash-command implementation remains backward compatible for everyone
+    without that policy.
+    """
+    if not isinstance(config, dict):
+        return None
+    model_cfg = config.get("model") or {}
+    if not isinstance(model_cfg, dict):
+        return None
+    value = str(model_cfg.get("openai_runtime_policy") or "").strip().lower()
+    return value if value in VALID_RUNTIMES else None
+
+
 def set_runtime(config: dict, new_value: str) -> str:
     """Mutate the config dict in place to persist the new runtime value.
     Returns the previous value for callers that want to report a delta."""
@@ -115,6 +132,18 @@ def apply(
     Returns: CodexRuntimeStatus describing the outcome.
     """
     current = get_current_runtime(config)
+    required = get_required_runtime(config)
+
+    if new_value is not None and required is not None and new_value != required:
+        return CodexRuntimeStatus(
+            success=False,
+            new_value=current,
+            old_value=current,
+            message=(
+                f"openai_runtime is operator-pinned to {required}; "
+                f"refusing {new_value}"
+            ),
+        )
 
     # Cache the codex binary check for this apply() call. Subprocess spawn
     # is cheap (~50ms for `codex --version`), but we'd otherwise call it up

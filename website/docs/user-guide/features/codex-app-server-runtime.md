@@ -197,6 +197,19 @@ model:
   openai_runtime: codex_app_server   # default is "auto" (= Hermes runtime)
 ```
 
+Managed deployments can prevent `/codex-runtime auto` (and its synonyms) from
+changing that selection:
+
+```yaml
+model:
+  openai_runtime: codex_app_server
+  openai_runtime_policy: codex_app_server
+```
+
+When the policy is present, the command reports that the runtime is
+operator-pinned and leaves the config unchanged. The policy is optional and
+does not alter the default behavior of unmanaged Hermes installations.
+
 ## Self-improvement loop (memory + skill nudges)
 
 Hermes' background self-improvement fires on counter thresholds:

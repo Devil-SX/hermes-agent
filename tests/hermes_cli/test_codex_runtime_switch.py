@@ -44,6 +44,16 @@ class TestGetCurrentRuntime:
             {"model": {"openai_runtime": "garbage"}}
         ) == "auto"
 
+    def test_operator_policy_is_independent_from_current_selection(self):
+        cfg = {
+            "model": {
+                "openai_runtime": "auto",
+                "openai_runtime_policy": "codex_app_server",
+            }
+        }
+        assert crs.get_current_runtime(cfg) == "auto"
+        assert crs.get_required_runtime(cfg) == "codex_app_server"
+
 
 class TestSetRuntime:
     def test_creates_model_section_if_missing(self):
@@ -59,6 +69,23 @@ class TestSetRuntime:
 
 
 class TestApply:
+
+    def test_operator_policy_rejects_runtime_downgrade_without_persisting(self):
+        cfg = {
+            "model": {
+                "openai_runtime": "codex_app_server",
+                "openai_runtime_policy": "codex_app_server",
+            }
+        }
+        persisted = []
+
+        result = crs.apply(cfg, "auto", persist_callback=persisted.append)
+
+        assert result.success is False
+        assert result.new_value == "codex_app_server"
+        assert "operator-pinned" in result.message
+        assert cfg["model"]["openai_runtime"] == "codex_app_server"
+        assert persisted == []
 
 
     def test_reapply_codex_app_server_runs_migration(self):
@@ -168,5 +195,4 @@ class TestApply:
         assert r.new_value == "codex_app_server"
         assert "MCP migration skipped" in r.message
         assert "disk full" in r.message
-
 
