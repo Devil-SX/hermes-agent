@@ -681,6 +681,7 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    plugin_user_context: str = "",
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -779,8 +780,26 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # The standard path appends validated ``pre_llm_call`` plugin context
+    # (authoritative model identity, gateway notes, ...) to the user text.
+    # This path previously dropped it, which left Codex-routed turns without
+    # the authoritative model metadata anchor (#model-identity-issue) and let
+    # the model misreport which model is serving the turn. Compose the
+    # context as a separate turn input item so it reaches the Codex model
+    # for this turn only; nothing here writes it to any persistent store.
+    turn_input: Any = user_message
+    if plugin_user_context:
+        context_text = plugin_user_context
+        if isinstance(user_message, list):
+            turn_input = [{"type": "text", "text": context_text}, *user_message]
+        else:
+            turn_input = [
+                {"type": "text", "text": context_text},
+                {"type": "text", "text": "" if user_message is None else str(user_message)},
+            ]
+
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(user_input=turn_input)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
