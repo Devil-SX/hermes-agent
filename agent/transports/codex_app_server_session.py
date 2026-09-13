@@ -223,37 +223,41 @@ def _notification_belongs_to_turn(
     return True
 
 
-def _coerce_turn_input_text(user_input: Any) -> str:
-    """Collapse Hermes/OpenAI rich content into app-server text input.
+def _coerce_turn_input(user_input: Any) -> list[dict[str, str]]:
+    """Translate rich content to Codex input without dropping image payloads.
 
-    The current `turn/start` path sends text items only. TUI image attachment
-    can hand us OpenAI-style content parts, so keep the text/path hints and
-    replace opaque image payloads with a small marker instead of putting a
-    Python list into the `text` field.
+    Images arrive from Hermes' validated native image routing as URLs/data URLs.
+    Never reinterpret a path as a localImage: that would grant the app-server
+    access to a caller-selected file outside its scoped workspace.
     """
-    if isinstance(user_input, str):
-        return user_input
-    if isinstance(user_input, list):
-        parts: list[str] = []
-        for item in user_input:
-            if isinstance(item, str):
-                if item.strip():
-                    parts.append(item)
-                continue
-            if not isinstance(item, dict):
-                if item is not None:
-                    parts.append(str(item))
-                continue
-            item_type = item.get("type")
-            if item_type in {"text", "input_text"}:
+    if not isinstance(user_input, list):
+        return [{"type": "text", "text": "" if user_input is None else str(user_input)}]
+    parts: list[dict[str, str]] = []
+    for item in user_input:
+        if isinstance(item, str):
+            if item.strip():
+                parts.append({"type": "text", "text": item})
+        elif isinstance(item, dict):
+            kind = item.get("type")
+            if kind in {"text", "input_text"}:
                 text = item.get("text") or item.get("content") or ""
                 if text:
-                    parts.append(str(text))
-            elif item_type in {"image", "image_url", "input_image"}:
-                parts.append("[image attached]")
-        text = "\n\n".join(p for p in parts if p).strip()
-        return text or "What do you see in this image?"
-    return "" if user_input is None else str(user_input)
+                    parts.append({"type": "text", "text": str(text)})
+            elif kind in {"image", "image_url", "input_image"}:
+                url = item.get("image_url") or item.get("url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+                if not isinstance(url, str) or not (
+                    url.startswith(("https://", "http://"))
+                    or (url.startswith("data:image/") and ";base64," in url)
+                ):
+                    raise ValueError("Image input requires an image URL or inline image data")
+                parts.append({"type": "image", "url": url})
+            elif kind in {"localImage", "local_image"}:
+                raise ValueError("Local image paths must pass through native image routing")
+        elif item is not None:
+            parts.append({"type": "text", "text": str(item)})
+    return parts or [{"type": "text", "text": "What do you see in this image?"}]
 
 
 # Substrings in codex stderr / JSON-RPC error messages that signal the
@@ -661,16 +665,20 @@ class CodexAppServerSession:
             return result
         projector = CodexEventProjector()
 
-        user_input_text = _coerce_turn_input_text(user_input)
+        try:
+            turn_input = _coerce_turn_input(user_input)
+        except ValueError as exc:
+            result.error = str(exc)
+            self._interrupt_event.clear()
+            return result
 
-        # Send turn/start with the user input. Text-only for now (codex
-        # supports rich content but Hermes' text path is the common case).
+        # Preserve native image parts in the public turn/start input contract.
         try:
             ts = self._client.request(
                 "turn/start",
                 {
                     "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
+                    "input": turn_input,
                 },
                 timeout=10,
             )

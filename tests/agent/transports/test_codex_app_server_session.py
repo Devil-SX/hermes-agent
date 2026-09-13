@@ -18,7 +18,7 @@ from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
-    _coerce_turn_input_text,
+    _coerce_turn_input,
 )
 
 
@@ -150,12 +150,57 @@ class TestApprovalChoiceMapping:
 
 
 class TestTurnInputCoercion:
-    def test_list_content_keeps_text_and_marks_images(self):
-        text = _coerce_turn_input_text([
+    @pytest.mark.parametrize("kind", ["image", "image_url", "input_image"])
+    def test_rich_turn_forwards_images_in_order(self, kind):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed", threadId="t", turn={"id": "tu1", "status": "completed"},
+        )
+        url = "data:image/png;base64,aGVsbG8="
+        result = make_session(client).run_turn([
             {"type": "text", "text": "caption"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-        ])
-        assert text == "caption\n\n[image attached]"
+            {"type": kind, "image_url": {"url": url}},
+            {"type": "image_url", "image_url": "https://example.invalid/image.png"},
+        ], turn_timeout=2.0)
+        assert result.error is None
+        request = next(p for m, p in client.requests if m == "turn/start")
+        assert request["input"] == [
+            {"type": "text", "text": "caption"},
+            {"type": "image", "url": url},
+            {"type": "image", "url": "https://example.invalid/image.png"},
+        ]
+
+    def test_native_image_routing_reaches_codex_as_inline_pixels(self, tmp_path):
+        from PIL import Image
+        from agent.image_routing import build_native_content_parts
+
+        path = tmp_path / "attachment.png"
+        Image.new("RGB", (16, 16), "red").save(path)
+        content, skipped = build_native_content_parts("describe", [str(path)])
+        assert not skipped
+        parts = _coerce_turn_input(content)
+        image = next(p for p in parts if p["type"] == "image")
+        assert image["url"].startswith("data:image/png;base64,")
+        assert image["url"] == content[1]["image_url"]["url"]
+
+    def test_image_only_and_text_inputs(self):
+        assert _coerce_turn_input("hello") == [{"type": "text", "text": "hello"}]
+        assert _coerce_turn_input([{"type": "image", "url": "https://example.invalid/i"}]) == [
+            {"type": "image", "url": "https://example.invalid/i"},
+        ]
+
+    @pytest.mark.parametrize("part", [
+        {"type": "image_url", "image_url": {"url": "file:///private/photo.png"}},
+        {"type": "image", "url": "/private/photo.png"},
+        {"type": "input_image"},
+        {"type": "localImage", "path": "/private/photo.png"},
+    ])
+    def test_invalid_image_fails_visibly_without_starting_turn(self, part):
+        client = FakeClient()
+        result = make_session(client).run_turn([part], turn_timeout=2.0)
+        assert result.error
+        assert "/private" not in result.error
+        assert not any(m == "turn/start" for m, _ in client.requests)
 
 
 # ---- lifecycle ----

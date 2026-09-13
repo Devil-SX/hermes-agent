@@ -4025,6 +4025,14 @@ def _normalize_empty_agent_response(
     message hits a stale generation token and returns an empty result,
     leaving the platform with nothing to send. (#31884)
     """
+    if (
+        _is_gateway_hidden_reasoning_incomplete_turn(agent_result)
+        and (not response or response == agent_result.get("error"))
+    ):
+        return (
+            "⚠️ The model did not produce a visible answer after automatic retries. "
+            "Please send your message again."
+        )
     if response:
         return response
 
@@ -4088,8 +4096,6 @@ def _normalize_empty_agent_response(
             )
         return response
     if api_calls > 0:
-        if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
-            return ""
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
             return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."

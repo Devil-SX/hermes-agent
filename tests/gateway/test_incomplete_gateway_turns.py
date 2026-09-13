@@ -14,8 +14,8 @@ from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 class CaptureSlackAdapter(BasePlatformAdapter):
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.SLACK)
+    def __init__(self, platform=Platform.SLACK):
+        super().__init__(PlatformConfig(enabled=True, token="fake-token"), platform)
         self.sent = []
         self.processing_hooks = []
 
@@ -71,12 +71,12 @@ def _make_incomplete_result() -> dict:
     }
 
 
-def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
+def _make_runner(adapter: CaptureSlackAdapter, platform=Platform.SLACK) -> gateway_run.GatewayRunner:
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="fake-token")}
+        platforms={platform: PlatformConfig(enabled=True, token="fake-token")}
     )
-    runner.adapters = {Platform.SLACK: adapter}
+    runner.adapters = {platform: adapter}
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
@@ -85,7 +85,7 @@ def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
         session_id="sess-1",
         created_at=datetime.now(),
         updated_at=datetime.now(),
-        platform=Platform.SLACK,
+        platform=platform,
         chat_type="channel",
     )
     runner.session_store.load_transcript.return_value = []
@@ -107,11 +107,11 @@ def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
     return runner
 
 
-def _make_event() -> MessageEvent:
+def _make_event(platform=Platform.SLACK) -> MessageEvent:
     return MessageEvent(
         text="hello",
         source=SessionSource(
-            platform=Platform.SLACK,
+            platform=platform,
             chat_id="C123",
             chat_type="channel",
             thread_id="171717",
@@ -122,9 +122,10 @@ def _make_event() -> MessageEvent:
 
 
 @pytest.mark.asyncio
-async def test_incomplete_codex_turn_stays_out_of_slack_transcript(monkeypatch, tmp_path):
-    adapter = CaptureSlackAdapter()
-    runner = _make_runner(adapter)
+@pytest.mark.parametrize("platform", [Platform.SLACK, Platform.TELEGRAM])
+async def test_incomplete_codex_turn_reports_retry_without_polluting_transcript(monkeypatch, tmp_path, platform):
+    adapter = CaptureSlackAdapter(platform)
+    runner = _make_runner(adapter, platform)
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
@@ -133,14 +134,17 @@ async def test_incomplete_codex_turn_stays_out_of_slack_transcript(monkeypatch, 
         lambda *_args, **_kwargs: 100,
     )
     monkeypatch.setenv("SLACK_HOME_CHANNEL", "C123")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "C123")
 
     adapter.set_message_handler(runner._handle_message)
     adapter._keep_typing = lambda *_args, **_kwargs: asyncio.Event().wait()
 
-    event = _make_event()
+    event = _make_event(platform)
     await adapter._process_message_background(event, build_session_key(event.source))
 
-    assert adapter.sent == []
+    assert len(adapter.sent) == 1
+    assert "Please send your message again" in adapter.sent[0]["content"]
+    assert "remained incomplete" not in adapter.sent[0]["content"]
     assert runner.session_store.update_session.called
 
     transcript_roles = [
@@ -153,3 +157,8 @@ async def test_incomplete_codex_turn_stays_out_of_slack_transcript(monkeypatch, 
         ("start", "m-1"),
         ("complete", "m-1", ProcessingOutcome.SUCCESS),
     ]
+
+
+def test_visible_response_is_preserved_when_partial_metadata_is_stale():
+    result = _make_incomplete_result()
+    assert gateway_run._normalize_empty_agent_response(result, "A visible answer") == "A visible answer"
