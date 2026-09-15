@@ -18,13 +18,168 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import shutil
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+# Media cache directory pairs (new_subpath, legacy_name) that inbound
+# platform attachments land in. Kept in sync with gateway/platforms/base.py
+# cache getters and tools/credential_files.py _CACHE_DIRS. Used to stage
+# attachment copies into a Codex agent's workspace so sandboxed tools can
+# read them (issue-20260831-152859-a6c78624).
+_MEDIA_CACHE_DIRS: list[tuple[str, str]] = [
+    ("cache/images", "image_cache"),
+    ("cache/documents", "document_cache"),
+    ("cache/audio", "audio_cache"),
+    ("cache/videos", "video_cache"),
+    ("cache/screenshots", "browser_screenshots"),
+    ("images", "images"),
+    ("attachments", "attachments"),
+]
+
+
+def _stage_cached_media_into_cwd(text: str, cwd: str | None) -> str:
+    """Copy Hermes media-cache files named in a turn's text into the agent
+    workspace and rewrite the text to reference the staged copies.
+
+    Inbound platform attachments (Telegram photos, PDFs, voice notes, ...)
+    are cached under Hermes-private directories (``~/.hermes/cache/images``,
+    ``.../documents``, ...) and the turn text names those host paths. The
+    isolated Codex group-agent sandbox denies ``~/.hermes`` wholesale, so
+    the model sees an attachment it can never open
+    (issue-20260831-152859-a6c78624).
+
+    For every cached path actually present in the text, this stages a copy
+    under ``<cwd>/attachments/<basename>`` — inside the workspace the
+    compiled sandbox already allows writes to — and rewrites the reference
+    to the staged path. Only the turn text changes; no persistent store is
+    touched, mirroring the ``plugin_user_context`` boundary.
+
+    Staging failures never block the turn: the original path survives and
+    the model degrades to its current behavior (for images the native
+    image part still carries the pixels).
+    """
+    if not text or not cwd:
+        return text
+    try:
+        from hermes_constants import get_hermes_dir
+    except Exception:
+        return text
+
+    roots: list[Path] = []
+    for new_subpath, old_name in _MEDIA_CACHE_DIRS:
+        try:
+            resolved = get_hermes_dir(new_subpath, old_name).resolve()
+        except Exception:
+            continue
+        if resolved not in roots:
+            roots.append(resolved)
+    if not roots:
+        return text
+
+    found: list[Path] = []
+    for match in re.finditer(r"/[\w.\-/@]+", text):
+        raw = match.group(0)
+        # Sentence punctuation ("saved at: /path/file.pdf. Its text ...")
+        # glues trailing dots onto the matched path; try the stripped form
+        # first, then the raw match.
+        stripped = raw.rstrip(".")
+        for raw_candidate in ([stripped] if stripped != raw else []) + [raw]:
+            candidate = Path(raw_candidate)
+            if not candidate.is_absolute():
+                continue
+            try:
+                resolved = candidate.resolve(strict=False)
+            except OSError:
+                resolved = candidate
+            if not any(
+                resolved == root or root in resolved.parents for root in roots
+            ):
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if resolved not in found:
+                found.append(resolved)
+            break
+
+    if not found:
+        return text
+
+    attachments_dir = Path(cwd) / "attachments"
+    staged_any = False
+    rewritten = text
+    for source in found:
+        try:
+            attachments_dir.mkdir(parents=True, exist_ok=True)
+            target = attachments_dir / source.name
+            shutil.copy2(source, target)
+        except OSError:
+            continue
+        rewritten = rewritten.replace(str(source), str(target))
+        staged_any = True
+
+    if not staged_any:
+        return text
+    return rewritten
+
+
+def _rewrite_turn_input_media_paths(turn_input: Any, cwd: str | None) -> Any:
+    """Stage media-cache paths found in a Codex turn input into ``cwd``.
+
+    Applies to plain-text inputs and to composed text items; multimodal
+    image items pass through untouched (their pixels already ride the
+    input; the accompanying text items get the readable staged paths).
+    Skipped entirely when the workspace itself lives under a media cache
+    root (nothing to stage, nothing to rewrite).
+    """
+    if not cwd or not isinstance(turn_input, (str, list)):
+        return turn_input
+    try:
+        cwd_resolved = Path(cwd).resolve()
+    except OSError:
+        return turn_input
+    from hermes_constants import get_hermes_dir
+
+    for new_subpath, old_name in _MEDIA_CACHE_DIRS:
+        try:
+            root = get_hermes_dir(new_subpath, old_name).resolve()
+        except Exception:
+            continue
+        if root == cwd_resolved or root in cwd_resolved.parents:
+            return turn_input
+    if isinstance(turn_input, str):
+        return _stage_cached_media_into_cwd(turn_input, cwd)
+    rewritten: list[Any] = []
+    for item in turn_input:
+        if isinstance(item, dict) and item.get("type") == "text":
+            rewritten.append(
+                {
+                    **item,
+                    "text": _stage_cached_media_into_cwd(
+                        str(item.get("text", "")), cwd
+                    ),
+                }
+            )
+        else:
+            rewritten.append(item)
+    return rewritten
+
+
+def _codex_turn_cwd(agent) -> str | None:
+    """Return the workspace root the Codex session was spawned with."""
+    session = getattr(agent, "_codex_session", None)
+    cwd = getattr(session, "_cwd", None)
+    return cwd if isinstance(cwd, str) and cwd else None
+
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
     """Return the serialized request size and exception class chain.
@@ -797,6 +952,17 @@ def run_codex_app_server_turn(
                 {"type": "text", "text": context_text},
                 {"type": "text", "text": "" if user_message is None else str(user_message)},
             ]
+
+    # The isolated group-agent sandbox denies Hermes-private media caches
+    # (~/.hermes/...), yet inbound attachment notes name those host paths.
+    # Stage every cached file the text references into the workspace and
+    # rewrite the references so sandboxed tools can actually read the
+    # attachment (issue-20260831-152859-a6c78624). No-op for workspaces
+    # under a cache root, for mock sessions without a real cwd, and when
+    # no referenced cache file exists.
+    turn_input = _rewrite_turn_input_media_paths(
+        turn_input, _codex_turn_cwd(agent)
+    )
 
     try:
         turn = agent._codex_session.run_turn(user_input=turn_input)
