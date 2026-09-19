@@ -5597,8 +5597,35 @@ class BasePlatformAdapter(ABC):
                 if not (result.retryable or self._is_retryable_error(error_str)):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
-                # All retries exhausted (loop completed without break) — notify user
-                logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
+                # Quick retries exhausted while the platform send path is
+                # likely still rebuilding (e.g. a Telegram Bad Gateway window
+                # where the adapter reconnect takes ~20s, longer than the
+                # entire quick-retry budget). Give the send path one final,
+                # recovery-aligned attempt with the ORIGINAL content before
+                # telling the user the message was lost.
+                recovery_delay = max(30.0, base_delay * (2 ** max_retries))
+                logger.warning(
+                    "[%s] Delivery failed after %d retries; final attempt in %.0fs: %s",
+                    self.name, max_retries, recovery_delay, error_str,
+                )
+                await asyncio.sleep(recovery_delay)
+                result = await self.send(
+                    chat_id=chat_id,
+                    content=content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                if result.success:
+                    logger.info(
+                        "[%s] Response delivered by final post-recovery attempt",
+                        self.name,
+                    )
+                    return result
+                error_str = result.error or error_str
+                logger.error(
+                    "[%s] Failed to deliver response after %d retries and one recovery-window attempt: %s",
+                    self.name, max_retries, error_str,
+                )
                 notice = (
                     "\u26a0\ufe0f Message delivery failed after multiple attempts. "
                     "Please try again \u2014 your request was processed but the response could not be sent."
@@ -5606,7 +5633,7 @@ class BasePlatformAdapter(ABC):
                 try:
                     await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
                 except Exception as notify_err:
-                    logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
+                    logger.warning("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback

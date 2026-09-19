@@ -125,25 +125,58 @@ class TestSendWithRetryNetworkRetry:
 
 
 # ---------------------------------------------------------------------------
-# _send_with_retry — all retries exhausted → user notification
+# _send_with_retry — all retries exhausted → final post-recovery redelivery
 # ---------------------------------------------------------------------------
 
 class TestSendWithRetryExhausted:
     @pytest.mark.asyncio
-    async def test_sends_user_notice_after_exhaustion(self):
+    async def test_final_redelivery_succeeds_after_recovery_window(self):
+        """Quick retries are often exhausted inside a platform adapter rebuild
+        window (~20s). One final attempt after a recovery-aligned delay must
+        deliver the ORIGINAL content before any user notice is sent."""
         adapter = _StubAdapter()
-        network_err = SendResult(success=False, error="httpx.ConnectError: host unreachable")
-        # initial + 2 retries + notice attempt
-        adapter._send_results = [network_err, network_err, network_err, SendResult(success=True)]
+        network_err = SendResult(success=False, error="httpx.ConnectError: Bad Gateway", retryable=True)
+        # initial + 2 quick retries fail inside the outage; the final
+        # post-recovery attempt succeeds
+        adapter._send_results = [network_err, network_err, network_err, SendResult(success=True, message_id="late")]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
+        assert result.success
+        # 4 total calls: 1 initial + 2 quick retries + 1 final redelivery
+        assert len(adapter._send_calls) == 4
+        # redelivered the ORIGINAL content, not a failure notice
+        assert adapter._send_calls[-1][1] == "hello"
+        # the final attempt waited past the adapter rebuild window
+        final_sleep = mock_sleep.call_args_list[-1][0][0]
+        assert final_sleep >= 25.0
+
+    @pytest.mark.asyncio
+    async def test_user_notice_only_after_final_redelivery_fails(self):
+        """The delivery-failure notice is sent only if even the final
+        post-recovery attempt fails."""
+        adapter = _StubAdapter()
+        network_err = SendResult(success=False, error="httpx.ConnectError: Bad Gateway", retryable=True)
+        # initial + 2 retries + final redelivery all fail, then notice succeeds
+        adapter._send_results = [network_err, network_err, network_err, network_err, SendResult(success=True)]
         with patch("asyncio.sleep", new_callable=AsyncMock):
             result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
-        # Result is the last failed one (before notice)
         assert not result.success
-        # 4 total calls: 1 initial + 2 retries + 1 notice
-        assert len(adapter._send_calls) == 4
-        # The notice content should mention delivery failure
+        # 5 total calls: 1 initial + 2 retries + 1 final redelivery + 1 notice
+        assert len(adapter._send_calls) == 5
         notice_content = adapter._send_calls[-1][1]
-        assert "delivery failed" in notice_content.lower() or "Message delivery failed" in notice_content
+        assert "delivery failed" in notice_content.lower()
+
+    @pytest.mark.asyncio
+    async def test_result_reflects_final_attempt_error(self):
+        """The returned failure result carries the final attempt's error."""
+        adapter = _StubAdapter()
+        network_err = SendResult(success=False, error="httpx.ConnectError: Bad Gateway", retryable=True)
+        late_err = SendResult(success=False, error="send_path_degraded", retryable=True)
+        adapter._send_results = [network_err, network_err, network_err, late_err, SendResult(success=True)]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
+        assert not result.success
+        assert result.error == "send_path_degraded"
 
 
 # ---------------------------------------------------------------------------
