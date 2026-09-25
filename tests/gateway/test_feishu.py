@@ -2467,3 +2467,163 @@ class TestChatLockEviction(unittest.TestCase):
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
 
 
+
+
+class TestFeishuWsObservabilityAndWatchdog(unittest.TestCase):
+    """Symmetric Feishu WS lifecycle logging + liveness watchdog.
+
+    Background (issue-20260925-050917-53adc7db): the Lark SDK recovers
+    transparently inside its own thread, but lark_oapi logs to the root
+    logger which never reaches gateway.log, and if the SDK gives up
+    (ReconnectCount exhausted) nothing ever tells the gateway — the channel
+    goes silently deaf.  These tests pin the observability contract and the
+    fail-closed watchdog handoff.
+    """
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        return FeishuAdapter(PlatformConfig())
+
+    def test_settings_include_ws_stale_timeout(self):
+        settings = type(self._make_adapter())._load_settings({})
+        self.assertEqual(settings.ws_stale_timeout, 600)
+
+    def test_sdk_hooks_bound_on_connect(self):
+        adapter = self._make_adapter()
+        adapter._connection_mode = "websocket"
+
+        class _FakeWSClient:
+            def __init__(self):
+                self.on_reconnecting = None
+                self.on_reconnected = None
+
+        fake_client = _FakeWSClient()
+        adapter._bind_sdk_lifecycle_hooks(fake_client)
+        self.assertIsNotNone(fake_client.on_reconnecting)
+        self.assertIsNotNone(fake_client.on_reconnected)
+
+    def test_hook_logging_and_activity_bump(self):
+        adapter = self._make_adapter()
+        adapter._connection_mode = "websocket"
+        adapter._ws_last_activity = None
+        adapter._ws_reconnecting = False
+
+        with self.assertLogs("plugins.platforms.feishu.adapter", level="WARNING") as captured:
+            adapter._on_ws_reconnecting()
+        self.assertTrue(any("[Feishu] Websocket reconnecting" in line for line in captured.output))
+        self.assertTrue(adapter._ws_reconnecting)
+        self.assertIsNotNone(adapter._ws_last_activity)
+
+        adapter._ws_reconnecting = True
+        with self.assertLogs("plugins.platforms.feishu.adapter", level="INFO") as captured:
+            adapter._on_ws_reconnected()
+        self.assertFalse(adapter._ws_reconnecting)
+        self.assertTrue(any("[Feishu] Websocket reconnected" in line for line in captured.output))
+
+    def test_watchdog_rebuilds_on_thread_exit(self):
+        adapter = self._make_adapter()
+        adapter._connection_mode = "websocket"
+        adapter._running = True
+        adapter._ws_last_activity = None
+        adapter._ws_reconnecting = False
+
+        async def scenario():
+            adapter._ws_thread_loop = None
+            adapter._ws_last_activity = None  # thread never started
+            fatal = await adapter._feishu_ws_watchdog_once()
+            return fatal
+
+        message, retryable = asyncio.run(scenario())
+        self.assertTrue(retryable)
+        self.assertIn("websocket thread exited", message)
+
+    def test_watchdog_rebuilds_on_stale_activity(self):
+        adapter = self._make_adapter()
+        adapter._connection_mode = "websocket"
+        adapter._running = True
+        adapter._ws_reconnecting = False
+
+        class _AliveLoop:
+            def is_closed(self):
+                return False
+
+        async def scenario():
+            adapter._ws_thread_loop = _AliveLoop()
+            adapter._ws_last_activity = time.monotonic() - 3600  # way past 600s
+            return await adapter._feishu_ws_watchdog_once()
+
+        message, retryable = asyncio.run(scenario())
+        self.assertTrue(retryable)
+        self.assertIn("no websocket activity", message)
+
+    def test_watchdog_holds_when_sdk_reconnecting(self):
+        adapter = self._make_adapter()
+        adapter._running = True
+
+        class _AliveLoop:
+            def is_closed(self):
+                return False
+
+        async def scenario():
+            adapter._ws_thread_loop = _AliveLoop()
+            adapter._ws_last_activity = time.monotonic() - 3600
+            adapter._ws_reconnecting = True  # SDK retrying: give it room
+            return await adapter._feishu_ws_watchdog_once()
+
+        self.assertIsNone(asyncio.run(scenario()))
+
+    def test_watchdog_holds_when_loop_dead_but_sdk_reconnecting(self):
+        adapter = self._make_adapter()
+        adapter._running = True
+
+        async def scenario():
+            adapter._ws_thread_loop = None
+            adapter._ws_last_activity = None
+            adapter._ws_reconnecting = True
+            return await adapter._feishu_ws_watchdog_once()
+
+        self.assertIsNone(asyncio.run(scenario()))
+
+    def test_watchdog_ignores_non_webhook_and_stopped_adapter(self):
+        adapter = self._make_adapter()
+        adapter._connection_mode = "webhook"
+        adapter._running = False
+
+        async def scenario():
+            return await adapter._feishu_ws_watchdog_once()
+
+        self.assertIsNone(asyncio.run(scenario()))
+
+    def test_fatal_via_run_coroutine_threadsafe(self):
+        """The WS-thread path must marshal the fatal notification onto the
+        adapter loop via run_coroutine_threadsafe, not call the async
+        notification from the wrong thread."""
+        import threading
+
+        adapter = self._make_adapter()
+        adapter._connection_mode = "websocket"
+        calls = {}
+
+        async def _capture():
+            return None
+
+        def _fake_rcts(coro, loop):
+            calls["loop"] = loop
+            calls["coroutine"] = coro
+            coro.close()
+            return SimpleNamespace()
+
+        async def scenario():
+            adapter._loop = asyncio.get_running_loop()
+            with patch(
+                "plugins.platforms.feishu.adapter.asyncio.run_coroutine_threadsafe",
+                side_effect=_fake_rcts,
+            ):
+                await adapter._raise_ws_fatal("test reason", retryable=True)
+
+        asyncio.run(scenario())
+        self.assertIn("loop", calls)
+        self.assertIn("coroutine", calls)
+        self.assertIsNotNone(calls["loop"])

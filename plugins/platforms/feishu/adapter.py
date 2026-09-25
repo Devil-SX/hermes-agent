@@ -218,6 +218,10 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
+# Watchdog: rebuild the platform when the SDK websocket shows no liveness for
+# this long.  The SDK's own reconnect pacing (nonce ≤30s + interval 120s) and
+# its 120s ping loop both fit comfortably inside this budget.
+_DEFAULT_WS_STALE_TIMEOUT_SECONDS = 600
 _FEISHU_SEND_ATTEMPTS = 3
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
@@ -431,6 +435,7 @@ class FeishuAdapterSettings:
     ws_reconnect_interval: int = 120
     ws_ping_interval: Optional[int] = None
     ws_ping_timeout: Optional[int] = None
+    ws_stale_timeout: int = _DEFAULT_WS_STALE_TIMEOUT_SECONDS
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
@@ -1518,6 +1523,14 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        # SDK lifecycle observability (issue-20260925-050917-53adc7db): lark_oapi
+        # logs to the root logger, so its transparent reconnects never reach
+        # gateway.log and a surrendered connection (ReconnectCount exhausted)
+        # would leave the channel silently deaf.  ``on_reconnecting`` /
+        # ``on_reconnected`` mirror the Telegram adapter's log contract, and
+        # ``_ws_last_activity`` feeds the watchdog.
+        self._ws_last_activity: Optional[float] = None
+        self._ws_reconnecting = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._webhook_runner: Optional[Any] = None
         self._webhook_site: Optional[Any] = None
@@ -1654,6 +1667,9 @@ class FeishuAdapter(BasePlatformAdapter):
             ws_reconnect_interval=_coerce_required_int(extra.get("ws_reconnect_interval"), default=120, min_value=1),
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
             ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
+            ws_stale_timeout=_coerce_required_int(
+                extra.get("ws_stale_timeout"), default=_DEFAULT_WS_STALE_TIMEOUT_SECONDS, min_value=30
+            ),
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
@@ -1691,6 +1707,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._ws_stale_timeout = settings.ws_stale_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
 
@@ -1921,6 +1938,93 @@ class FeishuAdapter(BasePlatformAdapter):
         self._pending_text_batches.clear()
         self._pending_text_batch_counts.clear()
         self._pending_media_batches.clear()
+
+    def _bind_sdk_lifecycle_hooks(self, ws_client: Any) -> None:
+        """Attach lark_oapi reconnect observer hooks for gateway-side logging.
+
+        The SDK reconnects transparently inside its websocket thread, but
+        lark_oapi logs to the root logger (journald), not gateway.log.  These
+        hooks mirror the Telegram adapter's log contract — every disconnect /
+        reconnect is visible where gateway ops actually look — and update the
+        watchdog liveness marker.  Webhook mode has no SDK lifecycle, so no
+        hooks are bound.
+        """
+        if self._connection_mode != "websocket" or ws_client is None:
+            return
+        try:
+            ws_client.on_reconnecting = self._on_ws_reconnecting
+            ws_client.on_reconnected = self._on_ws_reconnected
+        except Exception:
+            logger.debug("[Feishu] Failed to bind SDK lifecycle hooks", exc_info=True)
+
+    def _on_ws_reconnecting(self) -> None:
+        self._ws_reconnecting = True
+        self._ws_last_activity = time.monotonic()
+        logger.warning(
+            "[Feishu] Websocket reconnecting (SDK lost the connection and is retrying; "
+            "interval=%ss, nonce<=%ss)",
+            self._ws_reconnect_interval,
+            self._ws_reconnect_nonce,
+        )
+
+    def _on_ws_reconnected(self) -> None:
+        was_reconnecting = self._ws_reconnecting
+        self._ws_reconnecting = False
+        self._ws_last_activity = time.monotonic()
+        if was_reconnecting:
+            logger.info("[Feishu] Websocket reconnected (SDK retry succeeded)")
+
+    async def _raise_ws_fatal(self, reason: str, *, retryable: bool = True) -> None:
+        """Declare the Feishu connection fatally broken (from any thread).
+
+        Mirrors the Telegram adapter's escalation path: mark the fatal error,
+        then marshal ``_notify_fatal_error`` onto the adapter loop via
+        ``run_coroutine_threadsafe`` so the gateway tears this adapter down
+        and rebuilds the platform slot with the full reconnect log chain.
+        """
+        code = "feishu_ws_unreachable"
+        message = f"Feishu websocket unreachable: {reason}"
+        logger.error("[Feishu] %s Escalating to gateway recovery.", message)
+        self._set_fatal_error(code, message, retryable=retryable)
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._notify_fatal_error(), loop)
+        except RuntimeError:
+            logger.debug("[Feishu] Adapter loop rejected the fatal notification", exc_info=True)
+
+    async def _feishu_ws_watchdog_once(self) -> Optional[tuple]:
+        """Single watchdog evaluation; returns (reason, retryable) when the
+        websocket needs a full platform rebuild, else ``None``.
+
+        The lark_oapi SDK self-heals inside its thread (unbounded retries by
+        default), so transient gaps are normal and must not escalate.  Only
+        two shapes mean the SDK can no longer deliver:
+          • the websocket thread is gone (``_ws_thread_loop`` cleared) while
+            no SDK reconnect is in flight;
+          • the thread is alive but no liveness signal ever arrived and none
+            is pending — the SDK gave up without calling back.
+        """
+        if self._connection_mode != "websocket" or not self._running:
+            return None
+        if self._ws_reconnecting:
+            # SDK is actively retrying; give it room before escalating.
+            return None
+        loop = self._ws_thread_loop
+        if loop is None or loop.is_closed():
+            return ("websocket thread exited and SDK is not reconnecting", True)
+        last = self._ws_last_activity
+        if last is None:
+            return ("no websocket activity ever recorded and SDK is not reconnecting", True)
+        stale_for = time.monotonic() - last
+        if stale_for > self._ws_stale_timeout:
+            return (
+                f"no websocket activity for {int(stale_for)}s "
+                f"(stale timeout {self._ws_stale_timeout}s)",
+                True,
+            )
+        return None
 
     def _disable_websocket_auto_reconnect(self) -> None:
         if self._ws_client is None:
@@ -4952,6 +5056,9 @@ class FeishuAdapter(BasePlatformAdapter):
             # See https://github.com/NousResearch/hermes-agent/issues/50656
             extra_ua_tags=["channel"],
         )
+        self._bind_sdk_lifecycle_hooks(self._ws_client)
+        self._ws_last_activity = time.monotonic()
+        self._ws_reconnecting = False
         self._ws_future = loop.run_in_executor(
             None,
             _run_official_feishu_ws_client,
