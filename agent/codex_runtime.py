@@ -850,6 +850,14 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
+    from hermes_cli.config import load_config
+
+    # An exclusive native-auth owner must release idle subprocesses while
+    # preserving the durable thread id for the next turn's thread/resume.
+    model_config = load_config().get("model", {})
+    reuse_session = (model_config.get("codex_session_reuse", True)
+                     if isinstance(model_config, dict) else True)
+
     # A cached agent normally keeps one live app-server session. If the
     # gateway restored a different durable thread id (for example after a
     # session switch), retire the stale connection before creating the next
@@ -1035,6 +1043,9 @@ def run_codex_app_server_turn(
             agent._codex_session.close()
         except Exception:
             pass
+        agent._codex_session = None
+    elif reuse_session is False:
+        agent._codex_session.close()
         agent._codex_session = None
 
     # Splice projected messages into the conversation. The projector emits

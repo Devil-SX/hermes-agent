@@ -864,3 +864,29 @@ class TestCodexToolProgressBridge:
         captured_init["activity_callback"]()
         assert agent._last_activity_desc == "waiting on Codex app-server turn"
         assert ("tool.started", "exec_command", "pytest") in events
+
+
+def test_exclusive_native_owner_releases_each_turn_and_resumes(fake_session, tmp_path, monkeypatch):
+    from hermes_cli.config import save_config
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    save_config({"model": {"codex_session_reuse": False}})
+    sessions = []
+    original_init = CodexAppServerSession.__init__
+
+    def capture(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        sessions.append(self)
+
+    monkeypatch.setattr(CodexAppServerSession, "__init__", capture)
+    agent = _make_codex_agent()
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        first = agent.run_conversation("first")
+        assert first["completed"]
+        assert agent._codex_session is None
+        assert sessions[0]._closed
+        second = agent.run_conversation("second")
+    assert second["completed"]
+    assert agent._codex_session is None
+    assert len(sessions) == 2
+    assert sessions[1]._resume_thread_id == first["codex_thread_id"]
+    assert sessions[1]._closed
