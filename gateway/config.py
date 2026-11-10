@@ -896,9 +896,8 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
         cfg.extra.get("phone_number_id") and cfg.extra.get("access_token")
     ),
     Platform.SIGNAL: lambda cfg: bool(cfg.extra.get("http_url")),
-    Platform.API_SERVER: lambda cfg: _has_usable_api_server_key(
-        cfg.extra.get("key") if cfg else None
-    ),
+    Platform.API_SERVER: lambda cfg: bool(cfg and cfg.extra.get("authorization_provider"))
+        or _has_usable_api_server_key(cfg.extra.get("key") if cfg else None),
     Platform.WEBHOOK: lambda cfg: True,
     Platform.MSGRAPH_WEBHOOK: lambda cfg: bool(
         str(cfg.extra.get("client_state") or "").strip()
@@ -1632,7 +1631,7 @@ def load_gateway_config() -> GatewayConfig:
                 if not isinstance(_api_extra, dict):
                     _api_extra = {}
                     _api_plat["extra"] = _api_extra
-                for _bridge_key in ("port", "key", "host", "cors_origins", "model_name"):
+                for _bridge_key in ("port", "key", "host", "cors_origins", "model_name", "authorization_provider"):
                     if _bridge_key in _api_plat and _bridge_key not in _api_extra:
                         _api_extra[_bridge_key] = _api_plat.pop(_bridge_key)
 

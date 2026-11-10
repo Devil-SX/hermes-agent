@@ -45,6 +45,7 @@ import concurrent.futures
 import errno
 import hashlib
 import hmac
+import importlib
 import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
@@ -71,6 +72,7 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+_api_request_identity: ContextVar[str] = ContextVar("api_server_request_identity", default="")
 _api_request_browser_control_principal: ContextVar[str] = ContextVar(
     "api_server_browser_control_principal", default=""
 )
@@ -1544,6 +1546,19 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        self._authorization_provider = None
+        provider_path = extra.get("authorization_provider")
+        if provider_path:
+            if self._api_key:
+                raise ValueError("Configure either an API key or an authorization provider")
+            if not isinstance(provider_path, str) or not re.fullmatch(
+                r"[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*:[a-zA-Z_]\w*", provider_path
+            ):
+                raise ValueError("Authorization provider must be module:callable")
+            module, function = provider_path.split(":")
+            self._authorization_provider = getattr(importlib.import_module(module), function)
+            if not callable(self._authorization_provider):
+                raise TypeError("Authorization provider is not callable")
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1928,6 +1943,9 @@ class APIServerAdapter(BasePlatformAdapter):
     # Auth helper
     # ------------------------------------------------------------------
 
+    def _has_configured_auth(self) -> bool:
+        return bool(self._api_key or getattr(self, "_authorization_provider", None))
+
     def _expected_api_key(self) -> str:
         """Return the API key authorized for the URL-selected profile."""
         profile = _api_request_profile.get()
@@ -1960,6 +1978,12 @@ class APIServerAdapter(BasePlatformAdapter):
         connect() refuses to start the API server without API_SERVER_KEY, so
         the no-key branch only exists for tests or unsupported manual wiring.
         """
+        if getattr(self, "_authorization_provider", None) is not None:
+            # Only the asynchronous middleware can establish this proof.
+            # Never fall through to static-key or loopback authentication.
+            if request.get("gateway_authenticated_principal"):
+                return None
+            return web.json_response({"error": "Gateway authorization required"}, status=401)
         profile = _api_request_profile.get()
         is_named_profile = bool(profile and profile != "default")
         expected_key = self._expected_api_key()
@@ -2215,9 +2239,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             token = _api_request_profile.set(profile)
+            identity_token = _api_request_identity.set("")
             try:
                 with self._profile_scope(profile):
                     resolved_profile = profile or "default"
+                    authorizer = getattr(self, "_authorization_provider", None)
+                    if authorizer is not None:
+                        try:
+                            # Identity I/O must not block Telegram or the event loop.
+                            principal = await asyncio.to_thread(
+                                authorizer, method=request.method, path=request.path,
+                                authorization=request.headers.get("Authorization", ""),
+                                profile=resolved_profile,
+                            )
+                            if principal is None:
+                                return web.json_response({"error": "Invalid Gateway credential"}, status=401)
+                            if (not isinstance(principal, dict)
+                                    or not isinstance(principal.get("principal_id"), str)
+                                    or not 1 <= len(principal["principal_id"]) <= 256):
+                                raise ValueError("Invalid authorization provider result")
+                        except PermissionError:
+                            return web.json_response({"error": "Gateway operation denied"}, status=403)
+                        except Exception:
+                            logger.warning("Gateway authorization provider unavailable", exc_info=False)
+                            return web.json_response({"error": "Gateway authorization unavailable"}, status=503)
+                        request["gateway_authenticated_principal"] = principal
+                        _api_request_identity.set(principal["principal_id"])
                     principal_token = _api_request_browser_control_principal.set(
                         self._derive_browser_control_principal(resolved_profile)
                     )
@@ -2230,6 +2277,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         _api_request_browser_control_transport_family.reset(family_token)
                         _api_request_browser_control_principal.reset(principal_token)
             finally:
+                _api_request_identity.reset(identity_token)
                 _api_request_profile.reset(token)
 
         return profile_prefix_middleware
@@ -2336,7 +2384,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw:
             return None, None
 
-        if not self._api_key:
+        if not self._has_configured_auth():
             logger.warning(
                 "X-Hermes-Session-Key rejected: no API key configured. "
                 "Set API_SERVER_KEY to enable long-term memory scoping."
@@ -3362,7 +3410,10 @@ class APIServerAdapter(BasePlatformAdapter):
             "model": self._model_name,
             "auth": {
                 "type": "bearer",
-                "required": bool(self._api_key),
+                "required": self._has_configured_auth(),
+                **({key: request.get("gateway_authenticated_principal", {}).get(key)
+                    for key in ("caller", "operations")}
+                   if getattr(self, "_authorization_provider", None) is not None else {}),
             },
             "runtime": {
                 "mode": "server_agent",
@@ -3494,7 +3545,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=404,
             )
-        if not self._api_key:
+        if not self._has_configured_auth():
             logger.warning(
                 "browser-control registration rejected: no API key configured; "
                 "set API_SERVER_KEY to enable authenticated browser control."
@@ -3788,7 +3839,7 @@ class APIServerAdapter(BasePlatformAdapter):
         profile — so a client cannot impersonate another controller by
         echoing an id in the registration body.
         """
-        key = self._expected_api_key() or self._api_key or ""
+        key = _api_request_identity.get() or self._expected_api_key() or self._api_key or ""
         digest = hashlib.sha256(f"{profile}\x00{key}".encode("utf-8")).hexdigest()
         return f"principal:{profile}:{digest[:32]}"
 
@@ -3939,7 +3990,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=404,
             )
-        if not self._api_key:
+        if not self._has_configured_auth():
             return web.json_response(
                 _openai_error(
                     "Artifact transport requires a configured API key.",
@@ -4034,7 +4085,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         if not self._browser_control_enabled():
             raise web.HTTPNotFound()
-        if not self._api_key:
+        if not self._has_configured_auth():
             return web.json_response(
                 _openai_error(
                     "Artifact transport requires a configured API key.",
@@ -5128,7 +5179,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
-            if not self._api_key:
+            if not self._has_configured_auth():
                 logger.warning(
                     "Session continuation via X-Hermes-Session-Id rejected: "
                     "no API key configured.  Set API_SERVER_KEY to enable "
@@ -8311,6 +8362,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _api_key_passes_startup_guard(self) -> bool:
         """Return True when API_SERVER_KEY is present and strong enough to start."""
+        if getattr(self, "_authorization_provider", None) is not None:
+            return True
         if not self._api_key:
             logger.error(
                 "[%s] Refusing to start: API_SERVER_KEY is required for the API server, "
