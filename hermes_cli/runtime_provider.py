@@ -1935,6 +1935,21 @@ def resolve_runtime_provider(
     )
     model_cfg = _get_model_config()
 
+    # The native app-server owns authentication and refresh. Resolving the
+    # HTTP provider pool first creates a second OAuth owner and can reject a
+    # valid CLI login before the native runtime ever starts.
+    if _maybe_apply_codex_app_server_runtime(
+        provider=provider, api_mode="chat_completions", model_cfg=model_cfg
+    ) == "codex_app_server":
+        return {
+            "provider": provider,
+            "api_mode": "codex_app_server",
+            "base_url": "http://127.0.0.1:1",
+            "api_key": "native-cli-owned",
+            "source": "codex_app_server",
+            "requested_provider": requested_provider,
+        }
+
     # OpenCode Zen free tier (*-free slugs, e.g. x-preview-f-free /
     # "Ox Alpha"): served ANONYMOUSLY on the Zen relay ONLY. Any bearer the
     # relay doesn't recognize is a 401 — and the Go relay doesn't serve the
