@@ -1547,6 +1547,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
         self._authorization_provider = None
+        # PID values may be reused when a container restarts. This fence belongs
+        # to this adapter incarnation and is never restored from mutable state.
+        self._instance_id = str(uuid.uuid4())
+        self._accepted_restart_request = None
         provider_path = extra.get("authorization_provider")
         if provider_path:
             if self._api_key:
@@ -2291,6 +2295,7 @@ class APIServerAdapter(BasePlatformAdapter):
         routes: List[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
+            ("POST", "/api/gateway/restart", self._handle_gateway_restart),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
@@ -3237,6 +3242,52 @@ class APIServerAdapter(BasePlatformAdapter):
             {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
         )
 
+    async def _handle_gateway_restart(self, request: "web.Request") -> "web.Response":
+        """Request the runner's after-work restart, fenced to one incarnation.
+
+        An external supervisor owns process recreation. No detached helper or
+        host service manager is launched by this endpoint.
+        """
+        if self._authorization_provider is None:
+            return web.json_response({"error": "Native authorization required"}, status=403)
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response({"error": "JSON object required"}, status=400)
+        if (not isinstance(body, dict) or set(body) - {"expected_instance", "request_id", "delay_seconds"}
+                or 'expected_instance' not in body
+                or not isinstance(body.get("request_id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", body["request_id"])):
+            return web.json_response({"error": "Instance fence and request ID required"}, status=400)
+        delay = body.get('delay_seconds', 0)
+        if type(delay) is not int or not 0 <= delay <= 300:
+            return web.json_response({"error": "Delay must be an integer from 0 to 300"}, status=400)
+        if body["expected_instance"] != self._instance_id:
+            return web.json_response({"error": "Gateway instance changed",
+                                      "instance_id": self._instance_id}, status=409)
+        request_id = body["request_id"]
+        if self._accepted_restart_request is not None:
+            if self._accepted_restart_request != request_id:
+                return web.json_response({"error": "Another restart is already accepted"}, status=409)
+        else:
+            runner = self.gateway_runner or request.app.get("gateway_runner")
+            restart = getattr(runner, "request_restart", None)
+            if not callable(restart):
+                return web.json_response({"error": "Gateway runner unavailable"}, status=503)
+            if delay:
+                # Preserve the existing explicit after-response delay inside
+                # the owning event loop; no host timer or detached worker.
+                asyncio.get_running_loop().call_later(
+                    delay, lambda: restart(detached=False, via_service=True))
+            elif not restart(detached=False, via_service=True):
+                return web.json_response({"error": "Gateway restart already in progress"}, status=409)
+            self._accepted_restart_request = request_id
+        return web.json_response({"accepted": True, "request_id": request_id,
+                                  "instance_id": self._instance_id}, status=202)
+
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
 
@@ -3306,6 +3357,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # the state file may carry legacy epoch floats or hand-edited junk.
             "updated_at": normalize_updated_at(runtime.get("updated_at")),
             "pid": os.getpid(),
+            "instance_id": self._instance_id,
+            "restart_request_id": self._accepted_restart_request,
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
