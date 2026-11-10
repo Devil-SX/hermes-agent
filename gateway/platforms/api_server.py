@@ -1551,6 +1551,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # to this adapter incarnation and is never restored from mutable state.
         self._instance_id = str(uuid.uuid4())
         self._accepted_restart_request = None
+        self._native_drain_lock = asyncio.Lock()
+        self._cancelled_drain_requests = set()
         provider_path = extra.get("authorization_provider")
         if provider_path:
             if self._api_key:
@@ -2296,6 +2298,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("POST", "/api/gateway/restart", self._handle_gateway_restart),
+            ("POST", "/api/gateway/drain", self._handle_gateway_drain),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
@@ -3242,6 +3245,52 @@ class APIServerAdapter(BasePlatformAdapter):
             {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
         )
 
+    async def _handle_gateway_drain(self, request: "web.Request") -> "web.Response":
+        if self._authorization_provider is None:
+            return web.json_response({"error": "Native authorization required"}, status=403)
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response({"error": "JSON object required"}, status=400)
+        if (not isinstance(body, dict) or set(body) != {'request_id', 'expected_instance', 'action'}
+                or not isinstance(body.get('request_id'), str)
+                or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', body['request_id'])
+                or body.get('action') not in {'begin', 'refresh', 'cancel'}):
+            return web.json_response({'error': 'Fenced drain operation required'}, status=400)
+        if body['expected_instance'] != self._instance_id:
+            return web.json_response({'error': 'Gateway instance changed',
+                                      'instance_id': self._instance_id}, status=409)
+        from gateway.drain_control import update_owned_drain
+
+        principal = request['gateway_authenticated_principal']['principal_id']
+        owner = f"native:{principal}:{body['request_id']}"
+        # Serialize through the thread's durable completion. A cancel cannot
+        # overtake a queued begin, and a late begin cannot resurrect a cancelled
+        # operation in this incarnation. Old-incarnation calls fail the fence.
+        async with self._native_drain_lock:
+            if body['action'] != 'cancel' and owner in self._cancelled_drain_requests:
+                return web.json_response({'error': 'Drain request was cancelled'}, status=409)
+            async def apply_operation():
+                result = await asyncio.to_thread(update_owned_drain,
+                    principal=owner, action=body['action'])
+                if body['action'] == 'cancel':
+                    self._cancelled_drain_requests.add(owner)
+                return result
+            pending = asyncio.create_task(apply_operation())
+            try:
+                result = await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                # Retain serialization until the filesystem mutation settles.
+                await pending
+                raise
+            except (PermissionError, ValueError):
+                return web.json_response({'error': 'Drain ownership conflict'}, status=409)
+        return web.json_response({'instance_id': self._instance_id,
+                                  'request_id': body['request_id'], 'drain': result})
+
     async def _handle_gateway_restart(self, request: "web.Request") -> "web.Response":
         """Request the runner's after-work restart, fenced to one incarnation.
 
@@ -3308,6 +3357,9 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         runtime = read_runtime_status() or {}
+        from gateway.drain_control import drain_requested, read_drain_request
+
+        drain_marker = read_drain_request()
         gw_state = runtime.get("gateway_state")
         gw_active = parse_active_agents(runtime.get("active_agents", 0))
         # Prefer the live in-process total over the persisted snapshot.  API
@@ -3359,6 +3411,10 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
             "instance_id": self._instance_id,
             "restart_request_id": self._accepted_restart_request,
+            "drain": {"present": drain_marker is not None,
+                      "active": drain_requested(),
+                      "principal": (drain_marker or {}).get('principal'),
+                      "requested_at": (drain_marker or {}).get('requested_at')},
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":

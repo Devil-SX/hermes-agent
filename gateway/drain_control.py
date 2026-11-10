@@ -1,17 +1,10 @@
 """External drain-control marker contract (dashboard → gateway).
 
-Task 2.2 of the safe-shutdown plan (decisions.md Q-B, option A): the dashboard
-has no way to call into a running gateway — there is no HTTP control channel
-into the gateway process (guardrails: "there is NO external control channel
-into a running gateway"). Restart/drain is driven only by the gateway reacting
-to its own inputs: slash commands, process signals, and file markers it writes
-itself (``.restart_notify.json``).
-
-So the begin/cancel-drain dashboard endpoint communicates with the running
-gateway the same way: it writes (or removes) a marker file, and a gateway
-background watcher reacts to it. This module owns that marker contract so both
-sides — the dashboard endpoint (writer) and the gateway watcher (reader) —
-share one definition and can never disagree.
+This module owns the marker shared by the Gateway watcher and maintenance
+controllers. Native authenticated HTTP control runs the ownership transaction
+inside the Gateway namespace, using its instantiation epoch. The generic
+write/clear helpers remain the common persistence implementation; native callers
+use update_owned_drain to avoid overwriting another owner's marker.
 
 Contract (presence-based, mirroring ``.restart_notify.json``):
 
@@ -214,6 +207,55 @@ def clear_drain_request(*, home: Optional[Path] = None) -> bool:
     except OSError as e:
         _log.warning("drain-control: failed to remove %s: %s", path, e)
         return False
+
+
+def update_owned_drain(*, principal: str, action: str,
+                       home: Optional[Path] = None) -> dict[str, Any]:
+    """Serialize native control ownership around the existing marker contract.
+
+    Runs in the owning Gateway's process namespace, so the epoch is its own.
+    Unknown, malformed and differently owned markers are never overwritten.
+    """
+    import fcntl
+    import os
+
+    if action not in {'begin', 'refresh', 'cancel'} or not principal:
+        raise ValueError('Drain action and authenticated owner required')
+    path = drain_request_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path.parent / '.drain_control.lock',
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if path.is_symlink():
+            raise PermissionError('Gateway drain marker must not be a symlink')
+        existing = read_drain_request(home=home)
+        if existing is None and path.exists():
+            raise PermissionError('Gateway drain marker is unreadable')
+        if existing is not None and existing.get('principal') != principal:
+            raise PermissionError('Gateway drain belongs to another owner or is ambiguous')
+        if action == 'refresh' and existing is None:
+            raise ValueError('Existing owned drain required for refresh')
+        if action == 'cancel':
+            clear_drain_request(home=home)
+            if path.exists():
+                raise OSError('Gateway drain removal failed')
+            result = {'present': False, 'principal': principal}
+        else:
+            result = write_drain_request(principal=principal, suppress_notification=True, home=home)
+            result = {'present': True, **result}
+        # A successful HTTP receipt must follow durable marker creation/removal.
+        if path.exists():
+            with path.open('rb') as stream:
+                os.fsync(stream.fileno())
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return result
+    finally:
+        os.close(descriptor)
 
 
 def _marker_epoch_is_stale(body: dict[str, Any]) -> bool:
