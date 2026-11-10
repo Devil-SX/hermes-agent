@@ -23,6 +23,10 @@ def build_import_cmd_parser(subparsers, *, cmd_import: Callable) -> None:
     )
     import_parser.add_argument("zipfile", help="Path to the backup zip file")
     import_parser.add_argument(
+        "--no-start", action="store_true",
+        help="Restore files without starting or installing a Gateway service",
+    )
+    import_parser.add_argument(
         "--force",
         "-f",
         action="store_true",

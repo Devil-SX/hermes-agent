@@ -231,14 +231,33 @@ def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
 
 @contextmanager
 def _atomic_output_path(final_path: Path):
-    """Yield a hidden sibling path and publish it only after a clean close."""
+    """Publish only a persisted, CRC-verified archive, then persist its name."""
     partial_path = final_path.with_name(
         f".{final_path.name}.{os.getpid()}-{threading.get_ident()}.partial"
     )
     partial_path.unlink(missing_ok=True)
     try:
         yield partial_path
+        with partial_path.open("rb") as artifact:
+            os.fsync(artifact.fileno())
+            if sys.platform == "linux":
+                import ctypes
+
+                libc = ctypes.CDLL(None, use_errno=True)
+                if libc.syncfs(artifact.fileno()) != 0:
+                    errno = ctypes.get_errno()
+                    raise OSError(errno, os.strerror(errno))
+        with zipfile.ZipFile(partial_path) as archive:
+            failed = archive.testzip()
+            if failed is not None:
+                raise ValueError(f"Backup archive verification failed: {failed}")
         os.replace(partial_path, final_path)
+        if os.name != "nt":
+            descriptor = os.open(final_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
     except BaseException:
         partial_path.unlink(missing_ok=True)
         raise
@@ -653,6 +672,9 @@ def run_backup(args) -> None:
     except BackupInProgressError as exc:
         print(f"Error: {exc}")
         raise SystemExit(2) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Backup failed: {exc}")
+        raise SystemExit(1) from exc
 
 
 def _run_backup_locked(args, hermes_root: Path) -> None:
@@ -763,7 +785,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
     t0 = time.monotonic()
 
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-        archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+        archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6, strict_timestamps=False
     ) as zf:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
@@ -812,6 +834,11 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
                 errors.append(f"  {arcname}: {exc}")
                 continue
 
+        if errors:
+            # Keep a previous complete archive intact; never publish a partial
+            # export as a successful CLI operation.
+            raise RuntimeError("Incomplete backup: " + "; ".join(errors[:10]))
+
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
     logger.info(
@@ -824,10 +851,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
 
     # Summary
     print()
-    if errors:
-        print(f"Backup incomplete: {out_path}")
-    else:
-        print(f"Backup complete: {out_path}")
+    print(f"Backup complete: {out_path}")
     print(f"  Files:       {file_count}")
     print(f"  Original:    {_format_size(total_bytes)}")
     print(f"  Compressed:  {_format_size(zip_size)}")
@@ -852,15 +876,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         for d in sorted(skipped_dirs):
             print(f"    {d}/")
 
-    if errors:
-        print(f"\n  Warnings ({len(errors)} files skipped):")
-        for e in errors[:10]:
-            print(e)
-        if len(errors) > 10:
-            print(f"  ... and {len(errors) - 10} more")
-
-    if not errors:
-        print(f"\nRestore with: hermes import {out_path.name}")
+    print(f"\nRestore with: hermes import {out_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -1266,15 +1282,16 @@ def run_import(args) -> None:
         # platform-less gateway is a supported mode, so this is safe even
         # for backups with no messaging config). Best-effort and prompt-free;
         # failures print a manual fallback and never fail the import.
-        try:
-            from hermes_cli.gateway import ensure_gateway_service, _is_service_running
+        if not getattr(args, "no_start", False):
+            try:
+                from hermes_cli.gateway import ensure_gateway_service, _is_service_running
 
-            if not _is_service_running():
-                print()
-                ensure_gateway_service(context="import")
-        except Exception:
-            print("\nStart the gateway to activate cron jobs and messaging:")
-            print("  hermes gateway install")
+                if not _is_service_running():
+                    print()
+                    ensure_gateway_service(context="import")
+            except Exception:
+                print("\nStart the gateway to activate cron jobs and messaging:")
+                print("  hermes gateway install")
 
         print("Done. Your Hermes configuration has been restored.")
 
@@ -1992,7 +2009,7 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     archive_started = time.monotonic()
     try:
         with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6, strict_timestamps=False
         ) as zf:
             for index, (abs_path, rel_path) in enumerate(files_to_add, 1):
                 try:
@@ -2018,15 +2035,14 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                     else:
                         zf.write(abs_path, arcname=str(rel_path))
                 except (PermissionError, OSError, ValueError) as exc:
-                    logger.debug("Skipping %s in zip backup: %s", rel_path, exc)
-                    continue
+                    raise _SQLiteSnapshotError(f"Cannot back up {rel_path}: {exc}") from exc
                 if index % 500 == 0:
                     logger.info(
                         "automatic backup phase=archive status=progress completed=%d total=%d",
                         index,
                         len(files_to_add),
                     )
-    except (OSError, _SQLiteSnapshotError) as exc:
+    except (OSError, ValueError, zipfile.BadZipFile, _SQLiteSnapshotError) as exc:
         logger.warning("Full-zip backup: zip write failed: %s", exc)
         # ``_atomic_output_path`` already removed the hidden partial.  Do not
         # unlink ``out_path`` here: it may be a previous valid backup that the

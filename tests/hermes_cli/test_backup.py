@@ -309,6 +309,25 @@ class TestValidateBackupZip:
 # ---------------------------------------------------------------------------
 
 class TestImport:
+    def test_no_start_restores_without_touching_service_manager(self, tmp_path, monkeypatch):
+        import hermes_cli.gateway as gateway_mod
+        from hermes_cli.backup import run_import
+
+        home = tmp_path / '.hermes'
+        home.mkdir()
+        monkeypatch.setenv('HERMES_HOME', str(home))
+        monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+
+        def unexpected(*args, **kwargs):
+            pytest.fail('Isolated import touched the Gateway service manager')
+
+        monkeypatch.setattr(gateway_mod, '_is_service_running', unexpected)
+        monkeypatch.setattr(gateway_mod, 'ensure_gateway_service', unexpected)
+        archive = tmp_path / 'backup.zip'
+        self._make_backup_zip(archive, {'config.yaml': 'model: synthetic\n'})
+        run_import(Namespace(zipfile=str(archive), force=True, no_start=True))
+        assert (home / 'config.yaml').read_text() == 'model: synthetic\n'
+
     def _make_backup_zip(self, zip_path: Path, files: dict[str, str | bytes]) -> None:
         """Create a test zip with given files."""
         with zipfile.ZipFile(zip_path, "w") as zf:
@@ -615,8 +634,8 @@ class TestBackupEdgeCases:
         assert not (tmp_path / "out.zip").exists()
 
 
-    def test_pre1980_timestamp_skipped(self, tmp_path, monkeypatch):
-        """Backup skips files with pre-1980 timestamps (ZIP limitation)."""
+    def test_pre1980_timestamp_preserves_content(self, tmp_path, monkeypatch):
+        """ZIP timestamp limits must not discard business files."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text("model: test\n")
@@ -640,8 +659,8 @@ class TestBackupEdgeCases:
         with zipfile.ZipFile(out_zip, "r") as zf:
             names = zf.namelist()
             assert "config.yaml" in names
-            # The pre-1980 file should be skipped, not crash the backup
-            assert "ancient.txt" not in names
+            # Clamp the ZIP timestamp while preserving the original content.
+            assert zf.read("ancient.txt") == b"old data"
 
 
 
@@ -1819,3 +1838,45 @@ class TestMemoryProviderExternalPaths:
 
 
 
+class TestDurableFullBackup:
+    def test_incomplete_export_fails_and_preserves_previous(self, tmp_path, monkeypatch):
+        import hermes_cli.backup as backup
+
+        home = tmp_path / '.hermes'
+        home.mkdir()
+        _make_hermes_tree(home)
+        monkeypatch.setenv('HERMES_HOME', str(home))
+        monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+        monkeypatch.setattr(backup, '_safe_copy_db', lambda *a, **kw: False)
+        output = tmp_path / 'backup.zip'
+        output.write_bytes(b'previous-complete-artifact')
+        with pytest.raises(SystemExit) as failed:
+            backup.run_backup(Namespace(output=str(output)))
+        assert failed.value.code == 1
+        assert output.read_bytes() == b'previous-complete-artifact'
+        assert not list(tmp_path.glob('*.partial'))
+
+    def test_persistence_failure_never_publishes_success(self, tmp_path, monkeypatch):
+        import hermes_cli.backup as backup
+
+        output = tmp_path / 'backup.zip'
+        output.write_bytes(b'previous-complete-artifact')
+
+        def failed_sync(descriptor):
+            raise OSError('synthetic persistence failure')
+
+        monkeypatch.setattr(backup.os, 'fsync', failed_sync)
+        with pytest.raises(OSError, match='persistence failure'):
+            with backup._atomic_output_path(output) as partial:
+                with zipfile.ZipFile(partial, 'w') as archive:
+                    archive.writestr('config.yaml', 'model: synthetic\n')
+        assert output.read_bytes() == b'previous-complete-artifact'
+
+    def test_corrupt_archive_is_not_published(self, tmp_path):
+        from hermes_cli.backup import _atomic_output_path
+
+        output = tmp_path / 'backup.zip'
+        with pytest.raises(zipfile.BadZipFile):
+            with _atomic_output_path(output) as partial:
+                partial.write_bytes(b'not-an-archive')
+        assert not output.exists()
