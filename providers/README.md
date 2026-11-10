@@ -65,6 +65,7 @@ under `$HERMES_HOME/plugins/model-providers/` for a private plugin).
 
 | Hook | Purpose |
 |------|---------|
+| `prepare_request(request, *, metadata)` | Final physical-dispatch check for main and auxiliary calls, including streaming and retries. Receives the logical `api_request_id`; exceptions abort dispatch. Runs after Relay transformation, so private transport headers need not enter traces. |
 | `get_hostname()` | URL-based detection — default derives from `base_url`. |
 | `prepare_messages(msgs)` | Provider-specific message preprocessing (Qwen normalises to list-of-parts, injects `cache_control`). |
 | `build_extra_body(**ctx)` | Provider-specific `extra_body` (OpenRouter provider prefs, Gemini `thinking_config`). |

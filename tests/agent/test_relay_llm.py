@@ -1234,3 +1234,155 @@ def test_stream_current_inside_managed_callback_returns_raw(relay_turn):
     assert list(stream) == []
     assert stream.final_response is not None
     assert stream.final_response.choices[0].message.content == "done"
+
+
+@pytest.fixture()
+def request_guard(monkeypatch):
+    """Exercise the public registry, not a replacement dispatch adapter."""
+    import providers
+    from providers.base import ProviderProfile
+
+    providers.get_provider_profile("custom")  # finish normal discovery first
+    calls = []
+
+    class Guard(ProviderProfile):
+        def prepare_request(self, request, *, metadata):
+            calls.append((dict(request), dict(metadata)))
+            if metadata.get("reject"):
+                raise PermissionError("receipt requires reconciliation")
+            return {**request, "extra_headers": {"X-Test-Call-ID": metadata["api_request_id"]}}
+
+    monkeypatch.setitem(providers._REGISTRY, "test-request-guard", Guard(name="test-request-guard"))
+    return calls
+
+
+@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("reject", [False, True])
+def test_request_guard_sync_all_execution_modes(relay_turn, request_guard, monkeypatch, managed, reject):
+    if not managed:
+        monkeypatch.setattr(relay_runtime, "resolve_execution_context", lambda _: (None, None, None))
+    monkeypatch.setattr(relay_llm, "_codec", lambda *a, **k: None)
+    sent = []
+    metadata = {"api_request_id": "turn:api:1", "reject": reject}
+    def dispatch(request):
+        sent.append(request)
+        return {"content": "done"}
+    def invoke():
+        return relay_llm.execute({"model": "test-model"}, dispatch, session_id="session-1",
+                                 name="test-request-guard", model_name="test-model", metadata=metadata)
+    if reject:
+        with pytest.raises(PermissionError, match="reconciliation"):
+            invoke()
+        assert sent == []
+    else:
+        assert invoke() == {"content": "done"}
+        assert sent[0]["extra_headers"]["X-Test-Call-ID"] == "turn:api:1"
+    assert len(request_guard) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("reject", [False, True])
+async def test_request_guard_async_all_execution_modes(relay_turn, request_guard, monkeypatch, managed, reject):
+    if not managed:
+        monkeypatch.setattr(relay_runtime, "resolve_execution_context", lambda _: (None, None, None))
+    monkeypatch.setattr(relay_llm, "_codec", lambda *a, **k: None)
+    sent = []
+    async def dispatch(request):
+        sent.append(request)
+        return {"content": "done"}
+    async def invoke():
+        return await relay_llm.execute_async({"model": "test-model"}, dispatch, session_id="session-1",
+            name="test-request-guard", model_name="test-model", metadata={"api_request_id": "aux-1", "reject": reject})
+    if reject:
+        with pytest.raises(PermissionError, match="reconciliation"):
+            await invoke()
+        assert sent == []
+    else:
+        assert await invoke() == {"content": "done"}
+        assert sent[0]["extra_headers"]["X-Test-Call-ID"] == "aux-1"
+    assert len(request_guard) == 1
+
+
+@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("reject", [False, True])
+def test_request_guard_stream_all_execution_modes(relay_turn, request_guard, monkeypatch, managed, reject):
+    if not managed:
+        monkeypatch.setattr(relay_runtime, "resolve_execution_context", lambda _: (None, None, None))
+    monkeypatch.setattr(relay_llm, "_codec", lambda *a, **k: None)
+    sent = []
+    def dispatch(request):
+        sent.append(request)
+        return iter([{"content": "chunk"}])
+    def invoke():
+        return list(relay_llm.stream({"model": "test-model"}, dispatch, session_id="session-1",
+            name="test-request-guard", model_name="test-model", finalizer=lambda: {},
+            metadata={"api_request_id": "turn:api:1", "reject": reject}))
+    if reject:
+        with pytest.raises(PermissionError, match="reconciliation"):
+            invoke()
+        assert sent == []
+    else:
+        invoke()
+        assert sent[0]["extra_headers"]["X-Test-Call-ID"] == "turn:api:1"
+    assert len(request_guard) == 1
+
+
+@pytest.mark.asyncio
+async def test_request_guard_auxiliary_without_turn_and_nested_stream(request_guard, monkeypatch):
+    monkeypatch.setattr(relay_runtime, "active_turn", lambda: None)
+    metadata = {"api_request_id": "aux-stable"}
+    kwargs = dict(name="test-request-guard", model_name="test-model", metadata=metadata)
+    received = []
+    def dispatch(request):
+        received.append(request)
+        return request
+    async def dispatch_async(request):
+        return dispatch(request)
+    relay_llm.execute_current({}, dispatch, **kwargs)
+    await relay_llm.execute_current_async({}, dispatch_async, **kwargs)
+    relay_llm.stream_current({}, dispatch, finalizer=lambda: {}, **kwargs)
+    # An inherited turn in a running loop must still guard the nested bypass.
+    monkeypatch.setattr(relay_runtime, "active_turn", lambda: object())
+    relay_llm.stream_current({}, dispatch, finalizer=lambda: {}, **kwargs)
+    assert len(request_guard) == len(received) == 4
+    assert all(r["extra_headers"]["X-Test-Call-ID"] == "aux-stable" for r in received)
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_without_logical_context_cannot_bypass_provider_guard(request_guard, monkeypatch):
+    from agent import auxiliary_client
+
+    monkeypatch.setattr(auxiliary_client, "_relay_auxiliary_metadata", lambda **_: None)
+    monkeypatch.setattr(relay_runtime, "active_turn", lambda: None)
+    sent = []
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: sent.append(kw))))
+    # The test guard requires an existing logical ID. No context must fail,
+    # rather than generating a new ID or dispatching without preparation.
+    with pytest.raises(KeyError, match="api_request_id"):
+        auxiliary_client._relay_sync_completion(client, {}, provider="test-request-guard")
+    with pytest.raises(KeyError, match="api_request_id"):
+        await auxiliary_client._relay_async_completion(client, {}, provider="test-request-guard")
+    with pytest.raises(KeyError, match="api_request_id"):
+        auxiliary_client._relay_sync_stream(client, {}, provider="test-request-guard")
+    assert len(request_guard) == 3
+    assert sent == []
+
+
+def test_private_provider_headers_are_added_after_relay_request(relay_turn, request_guard, monkeypatch):
+    relay, _turn = relay_turn
+    traced, sent = [], []
+    execute = relay.llm.execute
+    async def capture(name, request, *args, **kwargs):
+        traced.append(dict(request.content))
+        return await execute(name, request, *args, **kwargs)
+    monkeypatch.setattr(relay.llm, "execute", capture)
+    monkeypatch.setattr(relay_llm, "_codec", lambda *a, **k: None)
+    def dispatch(request):
+        sent.append(request)
+        return {"content": "done"}
+    relay_llm.execute({"model": "test-model"}, dispatch, session_id="session-1",
+        name="test-request-guard", model_name="test-model", metadata={"api_request_id": "private-header"})
+    assert len(traced) == len(sent) == 1
+    assert "extra_headers" not in traced[0]
+    assert sent[0]["extra_headers"]["X-Test-Call-ID"] == "private-header"

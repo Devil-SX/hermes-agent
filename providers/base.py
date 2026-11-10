@@ -101,6 +101,19 @@ class ProviderProfile:
 
     # ── Hooks (override in subclass for complex providers) ───
 
+    def prepare_request(
+        self, request: dict[str, Any], *, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Prepare each physical call, including auxiliary calls and retries.
+
+        Runs immediately before provider dispatch, after Relay transformations.
+        metadata carries the logical api_request_id when available. Exceptions
+        abort dispatch rather than falling through to an unguarded request.
+        Providers can enforce gateway receipt/idempotency contracts here; this
+        does not give the profile ownership of clients or response streaming.
+        """
+        return request
+
     def resolve_aux_model(self, *, vision: bool = False) -> str:
         """Return a LIVE cheap-model id for auxiliary tasks, or "".
 

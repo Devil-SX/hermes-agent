@@ -3381,9 +3381,9 @@ def _relay_sync_completion(
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
-    if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
-    provider_name, fallback_model, metadata = route
+    provider_name, fallback_model, metadata = route or (
+        str(provider or "auxiliary"), str(kwargs.get("model") or "unknown"), {}
+    )
     from agent import relay_llm
 
     return relay_llm.execute_current(
@@ -3406,9 +3406,9 @@ async def _relay_async_completion(
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
-    if route is None:
-        return await callback(kwargs)
-    provider_name, fallback_model, metadata = route
+    provider_name, fallback_model, metadata = route or (
+        str(provider or "auxiliary"), str(kwargs.get("model") or "unknown"), {}
+    )
     from agent import relay_llm
 
     return await relay_llm.execute_current_async(
@@ -3429,9 +3429,9 @@ def _relay_sync_stream(
     api_mode: str | None = None,
 ) -> Any:
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
-    if route is None:
-        return client.chat.completions.create(**kwargs)
-    provider_name, fallback_model, metadata = route
+    provider_name, fallback_model, metadata = route or (
+        str(provider or "auxiliary"), str(kwargs.get("model") or "unknown"), {}
+    )
     from agent import relay_llm
 
     return relay_llm.stream_current(

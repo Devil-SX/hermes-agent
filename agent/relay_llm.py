@@ -70,6 +70,30 @@ def _relay_metadata(
     return relay_metadata
 
 
+def _prepare_provider_request(name, request, metadata):
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(name)
+    prepared = (profile.prepare_request(request, metadata=dict(metadata or {}))
+                if profile is not None else request)
+    if not isinstance(prepared, dict):
+        raise TypeError("Provider preparation must return a request object")
+    return prepared
+
+
+def _guard_provider_callback(name, callback, metadata):
+    def invoke(request):
+        return callback(_prepare_provider_request(name, request, metadata))
+    return invoke
+
+
+def _guard_provider_callback_async(name, callback, metadata):
+    async def invoke(request):
+        prepared = await asyncio.to_thread(_prepare_provider_request, name, request, metadata)
+        return await callback(prepared)
+    return invoke
+
+
 def execute(
     request: dict[str, Any],
     callback: Callable[[dict[str, Any]], Any],
@@ -81,6 +105,7 @@ def execute(
     defer_logical_completion: bool = False,
 ) -> Any:
     """Run one non-streaming physical provider attempt through Relay."""
+    callback = _guard_provider_callback(name, callback, metadata)
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         return callback(request)
@@ -173,6 +198,7 @@ async def execute_async(
     defer_logical_completion: bool = False,
 ) -> Any:
     """Run one asynchronous physical provider attempt through Relay."""
+    callback = _guard_provider_callback_async(name, callback, metadata)
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         return await callback(request)
@@ -267,7 +293,7 @@ def execute_current(
     """Run a provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
-        return callback(request)
+        return _guard_provider_callback(name, callback, metadata)(request)
     return execute(
         request,
         callback,
@@ -291,7 +317,7 @@ async def execute_current_async(
     """Run an async provider attempt under the inherited turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
-        return await callback(request)
+        return await _guard_provider_callback_async(name, callback, metadata)(request)
     return await execute_async(
         request,
         callback,
@@ -341,7 +367,7 @@ def stream_current(
     """
     turn = relay_runtime.active_turn()
     if turn is None:
-        return stream_factory(request)
+        return _guard_provider_callback(name, stream_factory, metadata)(request)
     if _has_running_event_loop():
         # Managed provider callbacks execute on the Relay session's event
         # loop. A nested ManagedLlmStream built here would be synchronously
@@ -352,7 +378,7 @@ def stream_current(
         # own completed_response_predicate traps a completed response (e.g.
         # the MoA facade's auxiliary ``call_llm(stream=True)`` returning a
         # full response when an adapter ignores ``stream=True``).
-        return stream_factory(request)
+        return _guard_provider_callback(name, stream_factory, metadata)(request)
     managed = stream(
         request,
         stream_factory,
@@ -429,6 +455,7 @@ class ManagedLlmStream(Iterator[Any]):
         metadata: dict[str, Any] | None,
         defer_logical_completion: bool,
     ) -> None:
+        stream_factory = _guard_provider_callback(name, stream_factory, metadata)
         self.final_response: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream: Any = None
