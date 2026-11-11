@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -30,10 +31,12 @@ def test_atomic_output_publishes_only_after_clean_close(tmp_path) -> None:
     final.write_bytes(b"previous")
 
     with _atomic_output_path(final) as partial:
-        partial.write_bytes(b"complete")
+        with zipfile.ZipFile(partial, "w") as archive:
+            archive.writestr("complete.txt", "complete")
         assert final.read_bytes() == b"previous"
 
-    assert final.read_bytes() == b"complete"
+    with zipfile.ZipFile(final) as archive:
+        assert archive.read("complete.txt") == b"complete"
     assert not partial.exists()
 
 
